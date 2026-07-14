@@ -29,7 +29,7 @@ class SMetricPolicy(KvCacheAffinityPolicy):
     """Balance new sessions and preserve local KV affinity for later turns."""
 
     @staticmethod
-    def select_endpoint_candidates_from_list(
+    def select_session_candidates_from_list(
         instances: list[Instance],
         req_info: RequestInfo,
         role: PDRole,

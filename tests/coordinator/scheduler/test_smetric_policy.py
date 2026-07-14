@@ -56,7 +56,7 @@ def test_first_turn_uses_load_balance_without_cache_query(query_conductor):
     instances = _instances(first_load=10, second_load=1)
     request = _request([{"role": "user", "content": "start"}])
 
-    candidates, uses_affinity = SMetricPolicy.select_endpoint_candidates_from_list(
+    candidates, uses_affinity = SMetricPolicy.select_session_candidates_from_list(
         instances,
         request,
         PDRole.ROLE_P,
@@ -85,7 +85,7 @@ def test_followup_sticks_to_resident_session(
     ])
     query_conductor.return_value = _conductor(first_match=90, second_match=10)
 
-    candidates, uses_affinity = SMetricPolicy.select_endpoint_candidates_from_list(
+    candidates, uses_affinity = SMetricPolicy.select_session_candidates_from_list(
         instances,
         request,
         PDRole.ROLE_P,
@@ -115,7 +115,7 @@ def test_evicted_session_falls_back_to_load_balance(
     ])
     query_conductor.return_value = _conductor(first_match=20, second_match=10)
 
-    candidates, uses_affinity = SMetricPolicy.select_endpoint_candidates_from_list(
+    candidates, uses_affinity = SMetricPolicy.select_session_candidates_from_list(
         instances,
         request,
         PDRole.ROLE_P,
@@ -144,7 +144,7 @@ def test_overloaded_session_target_migrates_by_load(
     ])
     query_conductor.return_value = _conductor(first_match=90, second_match=10)
 
-    candidates, uses_affinity = SMetricPolicy.select_endpoint_candidates_from_list(
+    candidates, uses_affinity = SMetricPolicy.select_session_candidates_from_list(
         instances,
         request,
         PDRole.ROLE_P,
@@ -163,7 +163,7 @@ def test_explicit_session_turn_supports_completion_requests():
     assert SMetricPolicy._is_followup_request(request) is True
 
 
-@patch.object(SMetricPolicy, "select_endpoint_candidates_from_list")
+@patch.object(SMetricPolicy, "select_session_candidates_from_list")
 def test_scheduler_client_marks_sticky_candidate_as_smetric(select_candidates):
     instance = _instances(first_load=1, second_load=2)[0]
     endpoint = instance.get_all_endpoints()[0]
@@ -183,7 +183,7 @@ def test_scheduler_client_marks_sticky_candidate_as_smetric(select_candidates):
     assert candidate_policy == "smetric"
 
 
-@patch.object(SMetricPolicy, "select_endpoint_candidates_from_list")
+@patch.object(SMetricPolicy, "select_session_candidates_from_list")
 def test_scheduler_client_marks_balanced_candidate_as_load_balance(
     select_candidates,
 ):

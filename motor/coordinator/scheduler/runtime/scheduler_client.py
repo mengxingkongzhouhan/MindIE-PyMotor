@@ -655,8 +655,6 @@ class AsyncSchedulerClient:
     ) -> tuple[Instance, Endpoint, Workload] | None:
         """Select instance locally + ALLOCATE_ONLY RPC. Allocation workload is decided here (RR=zero, LB=demand)."""
         role_str = role.value if role is not None else (getattr(PDRole.ROLE_U, "value", "union"))
-        cache_role = role if role is not None else PDRole.ROLE_U
-
         if self._workload_reader:
             current_version, heartbeat_stale = self._workload_reader.read_and_patch_cache(
                 self._cache
@@ -1048,7 +1046,7 @@ class AsyncSchedulerClient:
                     (n * self._client_index) // self._client_count if n else 0
                 )
                 candidates, uses_affinity = (
-                    SMetricPolicy.select_endpoint_candidates_from_list(
+                    SMetricPolicy.select_session_candidates_from_list(
                         instances,
                         req_info,
                         role,
