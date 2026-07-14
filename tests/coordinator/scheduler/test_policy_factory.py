@@ -24,6 +24,8 @@ from motor.config.coordinator import SchedulerType
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
+from motor.coordinator.scheduler.policy.session_affinity import SessionAffinityPolicy
 from tests.coordinator.scheduler.conftest import MockInstanceProvider
 
 
@@ -39,6 +41,16 @@ class TestPolicyFactory(unittest.TestCase):
         """create returns a LoadBalancePolicy for LOAD_BALANCE type."""
         policy = create(SchedulerType.LOAD_BALANCE, MockInstanceProvider())
         self.assertIsInstance(policy, LoadBalancePolicy)
+
+    def test_create_kv_cache_affinity(self):
+        """create returns a KvCacheAffinityPolicy for KV_CACHE_AFFINITY type."""
+        policy = create(SchedulerType.KV_CACHE_AFFINITY, MockInstanceProvider())
+        self.assertIsInstance(policy, KvCacheAffinityPolicy)
+
+    def test_create_session_affinity(self):
+        """create returns a SessionAffinityPolicy for SESSION_AFFINITY type."""
+        policy = create(SchedulerType.SESSION_AFFINITY, MockInstanceProvider())
+        self.assertIsInstance(policy, SessionAffinityPolicy)
 
     def test_create_unknown_type_raises(self):
         """create raises ValueError for unregistered type."""
