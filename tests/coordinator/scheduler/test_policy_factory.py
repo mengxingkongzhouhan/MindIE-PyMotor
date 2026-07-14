@@ -18,7 +18,6 @@ from motor.coordinator.scheduler.policy.factory import (
     create,
     register,
     SchedulingPolicyFactory,
-    _REGISTRY,
 )
 from motor.config.coordinator import SchedulerType
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
