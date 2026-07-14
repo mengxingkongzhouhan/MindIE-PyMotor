@@ -9,6 +9,10 @@ from unittest.mock import Mock, patch
 from motor.common.resources.instance import PDRole
 from motor.coordinator.api_client.conductor_api_client import TENANT_ID
 from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
+from motor.coordinator.scheduler.runtime.scheduler_client import (
+    AsyncSchedulerClient,
+    SchedulerClientConfig,
+)
 from tests.coordinator.scheduler.conftest import (
     create_mock_endpoint,
     create_mock_instance,
@@ -157,3 +161,45 @@ def test_explicit_session_turn_supports_completion_requests():
     request.req_data = {"prompt": "full session prompt", "session_turn": 3}
 
     assert SMetricPolicy._is_followup_request(request) is True
+
+
+@patch.object(SMetricPolicy, "select_endpoint_candidates_from_list")
+def test_scheduler_client_marks_sticky_candidate_as_smetric(select_candidates):
+    instance = _instances(first_load=1, second_load=2)[0]
+    endpoint = instance.get_all_endpoints()[0]
+    request = _request([{"role": "user", "content": "start"}])
+    select_candidates.return_value = ([(instance, endpoint, -100.0)], True)
+    client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="smetric"))
+
+    candidates, candidate_policy = (
+        client._select_endpoint_candidates_from_list_with_policy(
+            [instance],
+            PDRole.ROLE_P,
+            request,
+        )
+    )
+
+    assert candidates == [(instance, endpoint, -100.0)]
+    assert candidate_policy == "smetric"
+
+
+@patch.object(SMetricPolicy, "select_endpoint_candidates_from_list")
+def test_scheduler_client_marks_balanced_candidate_as_load_balance(
+    select_candidates,
+):
+    instance = _instances(first_load=1, second_load=2)[0]
+    endpoint = instance.get_all_endpoints()[0]
+    request = _request([{"role": "user", "content": "start"}])
+    select_candidates.return_value = ([(instance, endpoint, 1.0)], False)
+    client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="smetric"))
+
+    candidates, candidate_policy = (
+        client._select_endpoint_candidates_from_list_with_policy(
+            [instance],
+            PDRole.ROLE_P,
+            request,
+        )
+    )
+
+    assert candidates == [(instance, endpoint, 1.0)]
+    assert candidate_policy == "load_balance"
