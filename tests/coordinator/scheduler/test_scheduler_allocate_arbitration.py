@@ -12,6 +12,7 @@ from motor.coordinator.scheduler.runtime.scheduler_server import _SchedulerReque
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
+    CANDIDATE_POLICY_SMETRIC,
     SchedulerRequest,
     SchedulerRequestType,
     SchedulerResponseType,
@@ -320,6 +321,55 @@ async def test_allocate_only_affinity_reselects_least_loaded_among_candidates():
     assert response.data["endpoint"]["id"] == 20
     _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
     assert selected_workload.active_tokens == 13
+    assert workload_writer.writes == [(2, 20)]
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_migrates_overloaded_session():
+    """SchedulerServer should enforce SMetric's overload guard on a stale worker view."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.SMETRIC
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    config.scheduler_config.smetric_overload_threshold = 1.5
+    instance_manager = InstanceManager(config)
+
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=100))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=100))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=1))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=workload_writer,
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-overload",
+        data={
+            "instance_id": 1,
+            "endpoint_id": 10,
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-overload",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload": Workload(active_tokens=3).model_dump(mode="json"),
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["fast_path"] is False
+    assert response.data["instance"]["id"] == 2
+    assert response.data["endpoint"]["id"] == 20
     assert workload_writer.writes == [(2, 20)]
 
 

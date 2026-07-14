@@ -95,6 +95,12 @@ class SchedulerConnectionManager:
             kv_affinity_load_gate_topn=(
                 coordinator_config.scheduler_config.kv_affinity_load_gate_topn
             ),
+            smetric_overload_threshold=(
+                coordinator_config.scheduler_config.smetric_overload_threshold
+            ),
+            smetric_hit_ratio=(
+                coordinator_config.scheduler_config.smetric_hit_ratio
+            ),
             tls_config=coordinator_config.infer_tls_config,
             deploy_mode=coordinator_config.scheduler_config.deploy_mode,
             on_instance_refreshed=on_instance_refreshed,

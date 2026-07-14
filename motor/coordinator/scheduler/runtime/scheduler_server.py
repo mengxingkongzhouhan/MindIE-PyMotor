@@ -37,6 +37,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     SchedulerRequest, SchedulerResponse, SchedulerRequestType, SchedulerResponseType,
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+    CANDIDATE_POLICY_SMETRIC,
     KNOWN_CANDIDATE_POLICIES,
     INSTANCE_CHANGE_TOPIC,
     pack_send_frames, unpack_recv_payload,
@@ -164,6 +165,10 @@ class _SchedulerRequestDispatcher:
         self._endpoint_instance_score_weight = max(
             0.0,
             getattr(config.scheduler_config, "endpoint_instance_score_weight", 0.05),
+        )
+        self._smetric_overload_threshold = max(
+            1.0,
+            getattr(config.scheduler_config, "smetric_overload_threshold", 2.0),
         )
         scheduler_type = getattr(config.scheduler_config, "scheduler_type", "")
         self._is_load_balance_scheduler = (
@@ -475,11 +480,38 @@ class _SchedulerRequestDispatcher:
             selected = self._select_global_load_balance_candidate(role)
             if selected is not None:
                 return selected
+        if candidate_policy == CANDIDATE_POLICY_SMETRIC:
+            selected = self._select_authoritative_candidate(candidate, role)
+            if selected is not None and not self._is_smetric_target_overloaded(
+                selected[1], role
+            ):
+                return selected
+            load_balanced = self._select_global_load_balance_candidate(role)
+            if load_balanced is not None:
+                return load_balanced
+            return selected
         if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and len(candidates) > 1:
             selected = self._select_lowest_load_among_candidates(candidates, role)
             if selected is not None:
                 return selected
         return self._select_authoritative_candidate(candidate, role)
+
+    def _is_smetric_target_overloaded(
+        self,
+        target: Endpoint,
+        role: PDRole,
+    ) -> bool:
+        """Check SMetric's overload guard against the authoritative endpoint loads."""
+        loads = [
+            endpoint.workload.calculate_workload_score(role)
+            for instance in self._instance_manager.get_available_instances(role).values()
+            for endpoint in instance.get_all_endpoints()
+        ]
+        if not loads:
+            return False
+        target_load = target.workload.calculate_workload_score(role)
+        mean_load = sum(loads) / len(loads)
+        return target_load > self._smetric_overload_threshold * mean_load
 
     def _select_lowest_load_among_candidates(
         self,

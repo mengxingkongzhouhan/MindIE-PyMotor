@@ -28,6 +28,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_ROUND_ROBIN,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+    CANDIDATE_POLICY_SMETRIC,
     pack_send_frames, unpack_recv_payload,
     ZMQMessageSerializer,
 )
@@ -40,6 +41,7 @@ from motor.config.coordinator import (
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
+from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
 from motor.coordinator.domain.workload_calculator import calculate_demand_workload
 from motor.coordinator.models.request import RequestInfo
 
@@ -497,6 +499,8 @@ class SchedulerClientConfig:
     # Load-gated affinity: keep only the N least-loaded endpoints, then pick the best prefix
     # match among them. 0 disables it (uses the unified-score / legacy path instead).
     kv_affinity_load_gate_topn: int = 0
+    smetric_overload_threshold: float = 2.0
+    smetric_hit_ratio: float = 0.5
     tls_config: Any | None = None
     deploy_mode: Any | None = None
     on_instance_refreshed: OnInstanceRefreshedCallback | None = None
@@ -528,6 +532,10 @@ class AsyncSchedulerClient:
         self._kv_affinity_overlap_credit = max(0.0, config.kv_affinity_overlap_credit)
         self._kv_affinity_prefill_load_scale = max(0.0, config.kv_affinity_prefill_load_scale)
         self._kv_affinity_load_gate_topn = max(0, int(config.kv_affinity_load_gate_topn))
+        self._smetric_overload_threshold = max(
+            1.0, config.smetric_overload_threshold
+        )
+        self._smetric_hit_ratio = min(1.0, max(0.0, config.smetric_hit_ratio))
         self._deploy_mode = config.deploy_mode
 
         self._serializer = ZMQMessageSerializer()
@@ -1033,6 +1041,37 @@ class AsyncSchedulerClient:
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE
             logger.warning("load_balance unavailable, falling back to round-robin")
+        elif st == "smetric":
+            if role in _KVA_SELECT_ROLES:
+                n = len(instances)
+                start_index = (
+                    (n * self._client_index) // self._client_count if n else 0
+                )
+                candidates, uses_affinity = (
+                    SMetricPolicy.select_endpoint_candidates_from_list(
+                        instances,
+                        req_info,
+                        role,
+                        overload_threshold=self._smetric_overload_threshold,
+                        hit_ratio=self._smetric_hit_ratio,
+                        top_k=max(1, top_k),
+                        instance_score_weight=self._endpoint_instance_score_weight,
+                        start_index=start_index,
+                    )
+                )
+                if candidates:
+                    candidate_policy = (
+                        CANDIDATE_POLICY_SMETRIC
+                        if uses_affinity
+                        else CANDIDATE_POLICY_LOAD_BALANCE
+                    )
+                    return candidates, candidate_policy
+            candidates = self._select_endpoint_candidates_by_load_balance(
+                instances, role, top_k
+            )
+            if candidates:
+                return candidates, CANDIDATE_POLICY_LOAD_BALANCE
+            logger.warning("smetric unavailable, falling back to round-robin")
         # Round-robin path: default policy or load_balance fallback
         if role not in self._instance_rr_counters:
             self._instance_rr_counters[role] = 0
@@ -1061,7 +1100,7 @@ class AsyncSchedulerClient:
         if not all_endpoints:
             return None
         st = self._scheduler_type or "round_robin"
-        if st in ("load_balance", "kv_cache_affinity"):
+        if st in ("load_balance", "kv_cache_affinity", "smetric"):
             ep = LoadBalancePolicy.select_endpoint_from_instance(instance)
             if ep:
                 return (instance, ep)

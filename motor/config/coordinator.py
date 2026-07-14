@@ -104,6 +104,7 @@ class SchedulerType(Enum):
     LOAD_BALANCE = "load_balance"
     ROUND_ROBIN = "round_robin"
     KV_CACHE_AFFINITY = "kv_cache_affinity"
+    SMETRIC = "smetric"
 
     @classmethod
     def from_string(cls, value: str) -> Optional['SchedulerType']:
@@ -146,6 +147,10 @@ class SchedulerConfig:
     # Number of least-loaded endpoints kept by the "load_gated" mode before the affinity
     # tie-break. Only used when kv_affinity_mode="load_gated"; 0 (default) falls back to 2.
     kv_affinity_load_gate_topn: int = 0
+    # SMetric follows a cached session unless its target exceeds this multiple of mean load.
+    smetric_overload_threshold: float = 2.0
+    # Minimum cached-history ratio required to consider a follow-up session resident.
+    smetric_hit_ratio: float = 0.5
 
 
 @dataclass
@@ -582,6 +587,17 @@ class CoordinatorConfig:
             "kv_affinity_load_gate_topn",
             allow_zero=True,
         )
+        self._validate_positive_number(
+            self.scheduler_config.smetric_overload_threshold,
+            "smetric_overload_threshold",
+        )
+        self._validate_positive_number(
+            self.scheduler_config.smetric_hit_ratio,
+            "smetric_hit_ratio",
+            allow_zero=True,
+        )
+        if self.scheduler_config.smetric_hit_ratio > 1:
+            self._errors.append("smetric_hit_ratio must not exceed 1")
         if self.scheduler_config.kv_affinity_mode not in KV_AFFINITY_MODES:
             self._errors.append(
                 f"kv_affinity_mode must be one of {KV_AFFINITY_MODES}, "
