@@ -28,6 +28,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_ROUND_ROBIN,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+    CANDIDATE_POLICY_SESSION_AFFINITY,
     pack_send_frames, unpack_recv_payload,
     ZMQMessageSerializer,
 )
@@ -40,6 +41,7 @@ from motor.config.coordinator import (
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
+from motor.coordinator.scheduler.policy.session_affinity import SessionAffinityPolicy
 from motor.coordinator.domain.workload_calculator import calculate_demand_workload
 from motor.coordinator.models.request import RequestInfo
 
@@ -497,6 +499,10 @@ class SchedulerClientConfig:
     # Load-gated affinity: keep only the N least-loaded endpoints, then pick the best prefix
     # match among them. 0 disables it (uses the unified-score / legacy path instead).
     kv_affinity_load_gate_topn: int = 0
+    # session_affinity tunables (see SchedulerConfig.session_affinity_*).
+    session_affinity_overlap_credit: float = 1.0
+    session_affinity_overload_factor: float = 2.0
+    session_affinity_hit_ratio: float = 0.7
     tls_config: Any | None = None
     deploy_mode: Any | None = None
     on_instance_refreshed: OnInstanceRefreshedCallback | None = None
@@ -528,6 +534,9 @@ class AsyncSchedulerClient:
         self._kv_affinity_overlap_credit = max(0.0, config.kv_affinity_overlap_credit)
         self._kv_affinity_prefill_load_scale = max(0.0, config.kv_affinity_prefill_load_scale)
         self._kv_affinity_load_gate_topn = max(0, int(config.kv_affinity_load_gate_topn))
+        self._session_affinity_overlap_credit = max(0.0, config.session_affinity_overlap_credit)
+        self._session_affinity_overload_factor = max(0.0, config.session_affinity_overload_factor)
+        self._session_affinity_hit_ratio = max(0.0, config.session_affinity_hit_ratio)
         self._deploy_mode = config.deploy_mode
 
         self._serializer = ZMQMessageSerializer()
@@ -702,7 +711,10 @@ class AsyncSchedulerClient:
         # them by its fresh ledger (burst spreading); other roles/policies stay at top-1.
         request_top_k = (
             _AFFINITY_CANDIDATE_TOPK
-            if (role is PDRole.ROLE_P and (self._scheduler_type or "") == "kv_cache_affinity")
+            if (
+                role is PDRole.ROLE_P
+                and (self._scheduler_type or "") in ("kv_cache_affinity", "session_affinity")
+            )
             else 1
         )
         candidates, candidate_policy = await self._select_endpoint_candidates_with_policy(
@@ -1033,6 +1045,29 @@ class AsyncSchedulerClient:
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE
             logger.warning("load_balance unavailable, falling back to round-robin")
+        elif st == "session_affinity":
+            # SMetric-style balanced session-centric scheduling applies to KVA-eligible roles
+            # only; other roles fall through to the load_balance -> round_robin chain below.
+            if role in _KVA_SELECT_ROLES:
+                ranked = SessionAffinityPolicy.select_endpoint_candidates_from_list(
+                    instances,
+                    req_info,
+                    overlap_credit=self._session_affinity_overlap_credit,
+                    overload_factor=self._session_affinity_overload_factor,
+                    hit_ratio=self._session_affinity_hit_ratio,
+                    top_k=max(1, top_k),
+                )
+                if ranked:
+                    return ranked, CANDIDATE_POLICY_SESSION_AFFINITY
+                logger.warning(
+                    "session_affinity unavailable (no instances), falling back to load_balance"
+                )
+            candidates = self._select_endpoint_candidates_by_load_balance(
+                instances, role, top_k
+            )
+            if candidates:
+                return candidates, CANDIDATE_POLICY_LOAD_BALANCE
+            logger.warning("load_balance unavailable, falling back to round-robin")
         # Round-robin path: default policy or load_balance fallback
         if role not in self._instance_rr_counters:
             self._instance_rr_counters[role] = 0
@@ -1061,7 +1096,7 @@ class AsyncSchedulerClient:
         if not all_endpoints:
             return None
         st = self._scheduler_type or "round_robin"
-        if st in ("load_balance", "kv_cache_affinity"):
+        if st in ("load_balance", "kv_cache_affinity", "session_affinity"):
             ep = LoadBalancePolicy.select_endpoint_from_instance(instance)
             if ep:
                 return (instance, ep)

@@ -104,6 +104,7 @@ class SchedulerType(Enum):
     LOAD_BALANCE = "load_balance"
     ROUND_ROBIN = "round_robin"
     KV_CACHE_AFFINITY = "kv_cache_affinity"
+    SESSION_AFFINITY = "session_affinity"
 
     @classmethod
     def from_string(cls, value: str) -> Optional['SchedulerType']:
@@ -146,6 +147,20 @@ class SchedulerConfig:
     # Number of least-loaded endpoints kept by the "load_gated" mode before the affinity
     # tie-break. Only used when kv_affinity_mode="load_gated"; 0 (default) falls back to 2.
     kv_affinity_load_gate_topn: int = 0
+    # --- session_affinity tunables (SMetric-style balanced session-centric scheduling) ---
+    # How much a cached prefix discounts prefill work when ranking follow-up (turn > 0)
+    # requests by local KV$ hit (same semantics as kv_affinity_overlap_credit).
+    session_affinity_overlap_credit: float = 1.0
+    # "not_overloaded" guard: a follow-up request only sticks to the instance holding its
+    # session's KV$ when that instance's load is <= overload_factor * mean cluster load;
+    # otherwise it falls back to pure load balance for this request. Must be > 1 to allow any
+    # stickiness; SMetric reports the result is robust across a broad range (paper default 2.0).
+    session_affinity_overload_factor: float = 2.0
+    # "session_not_evicted" guard: a follow-up request only sticks when the best actual local
+    # KV$ hit reaches at least hit_ratio * (tokens estimated from the request's own carried
+    # history, excluding the freshly appended turn). Below this, the session's cache has likely
+    # been evicted and the request is treated as a fresh session (load-balanced) instead.
+    session_affinity_hit_ratio: float = 0.7
 
 
 @dataclass

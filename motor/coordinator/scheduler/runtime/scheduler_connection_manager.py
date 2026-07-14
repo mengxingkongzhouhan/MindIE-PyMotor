@@ -95,6 +95,15 @@ class SchedulerConnectionManager:
             kv_affinity_load_gate_topn=(
                 coordinator_config.scheduler_config.kv_affinity_load_gate_topn
             ),
+            session_affinity_overlap_credit=(
+                coordinator_config.scheduler_config.session_affinity_overlap_credit
+            ),
+            session_affinity_overload_factor=(
+                coordinator_config.scheduler_config.session_affinity_overload_factor
+            ),
+            session_affinity_hit_ratio=(
+                coordinator_config.scheduler_config.session_affinity_hit_ratio
+            ),
             tls_config=coordinator_config.infer_tls_config,
             deploy_mode=coordinator_config.scheduler_config.deploy_mode,
             on_instance_refreshed=on_instance_refreshed,

@@ -37,6 +37,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     SchedulerRequest, SchedulerResponse, SchedulerRequestType, SchedulerResponseType,
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+    CANDIDATE_POLICY_SESSION_AFFINITY,
     KNOWN_CANDIDATE_POLICIES,
     INSTANCE_CHANGE_TOPIC,
     pack_send_frames, unpack_recv_payload,
@@ -467,15 +468,18 @@ class _SchedulerRequestDispatcher:
         Select allocation target using SchedulerServer's authoritative workload view.
 
         Load-balance can scan all endpoints cheaply at the current cluster size. KV-cache affinity
-        re-picks the least-loaded among the worker's affinity-ranked alternates (preserving
-        affinity while spreading a stale-view burst). Other policies keep the worker-proposed
-        endpoint semantics.
+        and session-affinity both re-pick the least-loaded among the worker's ranked alternates
+        (preserving affinity/stickiness while spreading a stale-view burst). Other policies keep
+        the worker-proposed endpoint semantics.
         """
         if self._should_scan_global_load_balance(candidate_policy):
             selected = self._select_global_load_balance_candidate(role)
             if selected is not None:
                 return selected
-        if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and len(candidates) > 1:
+        if (
+            candidate_policy in (CANDIDATE_POLICY_KV_CACHE_AFFINITY, CANDIDATE_POLICY_SESSION_AFFINITY)
+            and len(candidates) > 1
+        ):
             selected = self._select_lowest_load_among_candidates(candidates, role)
             if selected is not None:
                 return selected
