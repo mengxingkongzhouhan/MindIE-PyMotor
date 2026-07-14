@@ -85,8 +85,7 @@ class SMetricPolicy(KvCacheAffinityPolicy):
         )
         if matched_tokens < max(0.0, hit_ratio) * expected_hit:
             logger.debug(
-                "smetric: expected session prefix was evicted "
-                "(matched=%s expected=%s ratio=%.2f)",
+                "smetric: expected session prefix was evicted (matched=%s expected=%s ratio=%.2f)",
                 matched_tokens,
                 expected_hit,
                 hit_ratio,
@@ -97,8 +96,7 @@ class SMetricPolicy(KvCacheAffinityPolicy):
         threshold = max(1.0, overload_threshold)
         if load_cost > threshold * mean_load:
             logger.debug(
-                "smetric: affinity target overloaded "
-                "(load=%.2f mean=%.2f threshold=%.2f)",
+                "smetric: affinity target overloaded (load=%.2f mean=%.2f threshold=%.2f)",
                 load_cost,
                 mean_load,
                 threshold,
@@ -130,10 +128,7 @@ class SMetricPolicy(KvCacheAffinityPolicy):
             instance_score_weight=instance_score_weight,
             start_index=start_index,
         )
-        return [
-            (candidate.instance, candidate.endpoint, candidate.score)
-            for candidate in candidates
-        ]
+        return [(candidate.instance, candidate.endpoint, candidate.score) for candidate in candidates]
 
     @staticmethod
     def _is_followup_request(req_info: RequestInfo) -> bool:
@@ -148,11 +143,7 @@ class SMetricPolicy(KvCacheAffinityPolicy):
         messages = request_data.get(OpenAIField.MESSAGES)
         if not isinstance(messages, list):
             return False
-        return any(
-            isinstance(message, dict)
-            and message.get("role") in {"assistant", "tool"}
-            for message in messages
-        )
+        return any(isinstance(message, dict) and message.get("role") in {"assistant", "tool"} for message in messages)
 
     @staticmethod
     def _estimate_history_tokens(
@@ -166,13 +157,12 @@ class SMetricPolicy(KvCacheAffinityPolicy):
                 (
                     index
                     for index in range(len(messages) - 1, -1, -1)
-                    if isinstance(messages[index], dict)
-                    and messages[index].get("role") == "assistant"
+                    if isinstance(messages[index], dict) and messages[index].get("role") == "assistant"
                 ),
                 -1,
             )
             if last_assistant >= 0:
-                history = messages[:last_assistant + 1]
+                history = messages[: last_assistant + 1]
                 tools = request_data.get(OpenAIField.TOOLS)
                 return len(TokenizerManager().apply_chat_template(history, tools))
 
