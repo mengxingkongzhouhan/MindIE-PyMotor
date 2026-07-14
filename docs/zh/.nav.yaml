@@ -14,6 +14,7 @@ nav:
       - 链路追踪部署: user_guide/tracing_deployment.md
       - KV Pool 部署: user_guide/KV_pool_deployment_guide.md
       - KV Cache 亲和部署: user_guide/KV_cache_affinity_deployment.md
+      - 会话亲和调度部署: user_guide/session_affinity_deployment.md
       - 手动扩缩容指南: user_guide/manual_scaling_guide.md
       - 组件:
           - Controller: user_guide/components/controller.md
