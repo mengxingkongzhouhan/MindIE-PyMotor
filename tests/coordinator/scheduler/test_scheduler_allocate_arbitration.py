@@ -466,7 +466,7 @@ async def test_allocate_only_fast_path_accepts_encode_candidate():
 
 @pytest.mark.asyncio
 async def test_allocate_only_tracks_and_returns_active_requests():
-    """ALLOCATE_ONLY should increment in-flight request counts and expose P/D totals."""
+    """ALLOCATE_ONLY should expose per-endpoint in-flight request counts for P/D pools."""
     config = CoordinatorConfig()
     config.scheduler_config.scheduler_type = SchedulerType.LOAD_BALANCE
     config.scheduler_config.endpoint_instance_score_weight = 0.0
@@ -477,6 +477,9 @@ async def test_allocate_only_tracks_and_returns_active_requests():
     await instance_manager.refresh_instances(EventType.ADD, [prefill, decode])
     await instance_manager.update_instance_workload(
         2, 20, Workload(active_requests=2)
+    )
+    await instance_manager.update_instance_workload(
+        2, 21, Workload(active_requests=1)
     )
 
     scheduler = Scheduler(instance_provider=instance_manager, config=config)
@@ -508,8 +511,8 @@ async def test_allocate_only_tracks_and_returns_active_requests():
     assert response.data["instance"]["id"] == 1
     assert response.data["endpoint"]["id"] == 10
     assert response.data["active_requests"] == 1
-    assert response.data["prefill_inflight"] == 1
-    assert response.data["decode_inflight"] == 2
+    assert response.data["prefill_endpoints"] == {"1:10": 1, "1:11": 0}
+    assert response.data["decode_endpoints"] == {"2:20": 2, "2:21": 1}
     assert response.data["endpoint"]["workload"]["active_requests"] == 1
     _, selected_workload = await instance_manager.get_endpoint_workload(1, 10)
     assert selected_workload.active_requests == 1

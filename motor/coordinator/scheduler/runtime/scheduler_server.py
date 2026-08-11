@@ -88,13 +88,21 @@ _KEY_FAST_PATH = "fast_path"
 _KEY_CANDIDATE_POLICY = "candidate_policy"
 _KEY_CANDIDATES = "candidates"
 _KEY_ACTIVE_REQUESTS = "active_requests"
-_KEY_PREFILL_INFLIGHT = "prefill_inflight"
-_KEY_DECODE_INFLIGHT = "decode_inflight"
+_KEY_PREFILL_ENDPOINTS = "prefill_endpoints"
+_KEY_DECODE_ENDPOINTS = "decode_endpoints"
 
 
 def _should_log_scheduling_sample(sample_key: str) -> bool:
     """Return True for ~1/_SCHEDULING_LOG_SAMPLE_RATE of requests (hot-path info sampling)."""
     return bool(sample_key) and hash(sample_key) % _SCHEDULING_LOG_SAMPLE_RATE == 0
+
+
+def _format_endpoint_active_requests(endpoint_counts: dict[str, int]) -> str:
+    """Format per-endpoint in-flight counts for logs: ins:ep=count,..."""
+    if not endpoint_counts:
+        return "none"
+    return ",".join(f"{key}={count}" for key, count in endpoint_counts.items())
+
 
 # ==================== Serialization (module-level, shared by Server / Broadcaster) ====================
 
@@ -398,15 +406,17 @@ class _SchedulerRequestDispatcher:
         instance_data = _serialize_instance_minimal(instance) if instance else None
         endpoint_data = _serialize_endpoint_minimal(endpoint) if endpoint else None
         ep_active_requests = int(endpoint.workload.active_requests)
-        prefill_inflight = self._sum_role_active_requests(PDRole.ROLE_P)
-        decode_inflight = self._sum_role_active_requests(PDRole.ROLE_D)
+        prefill_endpoints = self._role_endpoint_active_requests(PDRole.ROLE_P)
+        decode_endpoints = self._role_endpoint_active_requests(PDRole.ROLE_D)
         if _should_log_scheduling_sample(req_id or request.request_id):
             logger.info(
                 "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "
-                "active_requests=%d prefill_inflight=%d decode_inflight=%d "
+                "active_requests=%d prefill_endpoints=%s decode_endpoints=%s "
                 "score=%.4f fast_path=%s",
                 req_id, role.value, instance.id, endpoint.id,
-                ep_active_requests, prefill_inflight, decode_inflight,
+                ep_active_requests,
+                _format_endpoint_active_requests(prefill_endpoints),
+                _format_endpoint_active_requests(decode_endpoints),
                 selected_score, fast_path,
             )
         return SchedulerResponse(
@@ -418,8 +428,8 @@ class _SchedulerRequestDispatcher:
                 _KEY_SELECTED_SCORE: selected_score,
                 _KEY_FAST_PATH: fast_path,
                 _KEY_ACTIVE_REQUESTS: ep_active_requests,
-                _KEY_PREFILL_INFLIGHT: prefill_inflight,
-                _KEY_DECODE_INFLIGHT: decode_inflight,
+                _KEY_PREFILL_ENDPOINTS: prefill_endpoints,
+                _KEY_DECODE_ENDPOINTS: decode_endpoints,
             },
         )
 
@@ -433,14 +443,15 @@ class _SchedulerRequestDispatcher:
         except (TypeError, ValueError):
             return None
 
-    def _sum_role_active_requests(self, role: PDRole) -> int:
-        """Sum in-flight request counts across all endpoints for a role pool."""
-        total = 0
+    def _role_endpoint_active_requests(self, role: PDRole) -> dict[str, int]:
+        """Per-endpoint in-flight request counts for a role pool: {\"ins:ep\": count}."""
+        counts: dict[str, int] = {}
         for instance in self._instance_manager.get_available_instances(role).values():
             for pod_eps in (instance.endpoints or {}).values():
                 for ep in (pod_eps or {}).values():
-                    total += int(getattr(ep.workload, "active_requests", 0) or 0)
-        return total
+                    key = f"{instance.id}:{ep.id}"
+                    counts[key] = int(getattr(ep.workload, "active_requests", 0) or 0)
+        return counts
 
     @staticmethod
     def _extract_allocate_candidate(data: dict) -> tuple[int, int] | None:
