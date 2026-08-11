@@ -138,6 +138,7 @@ class _SchedulerInstanceCache:
         role: PDRole,
         active_tokens: float,
         active_kv_cache: float,
+        active_requests: int = 0,
     ) -> None:
         """Patch single endpoint workload from shared memory. Skip if not in cache."""
         role_map = self._instance_map.get(role) or {}
@@ -151,6 +152,7 @@ class _SchedulerInstanceCache:
         cached_endpoint.workload = Workload(
             active_tokens=active_tokens,
             active_kv_cache=active_kv_cache,
+            active_requests=active_requests,
         )
         if cached_instance.gathered_workload is None:
             cached_instance.gathered_workload = Workload()
@@ -159,6 +161,9 @@ class _SchedulerInstanceCache:
         )
         cached_instance.gathered_workload.active_kv_cache += (
             active_kv_cache - old_workload.active_kv_cache
+        )
+        cached_instance.gathered_workload.active_requests += (
+            active_requests - old_workload.active_requests
         )
 
     def _apply_role_under_lock(self, role: PDRole, instances: list[Instance]) -> None:
@@ -717,9 +722,10 @@ class AsyncSchedulerClient:
             for cand_instance, cand_endpoint, _score in candidates
         ]
 
-        # Allocation workload: RR does not use load, so use zero; LB uses demand for accounting.
+        # Allocation workload: RR has no load score but still counts in-flight requests;
+        # LB/affinity use demand scores plus active_requests=1.
         workload = (
-            Workload()
+            Workload(active_requests=1)
             if (self._scheduler_type or "round_robin") == "round_robin"
             else calculate_demand_workload(role, req_info)
         )
@@ -765,8 +771,12 @@ class AsyncSchedulerClient:
             out_endpoint = _endpoint_from_dict(endpoint_data)
             if out_endpoint:
                 logger.debug(
-                    "select_and_allocate success role=%s instance_id=%s endpoint_id=%s",
-                    role_str, out_instance.id, out_endpoint.id
+                    "select_and_allocate success role=%s instance_id=%s endpoint_id=%s "
+                    "active_requests=%s prefill_inflight=%s decode_inflight=%s",
+                    role_str, out_instance.id, out_endpoint.id,
+                    data.get("active_requests"),
+                    data.get("prefill_inflight"),
+                    data.get("decode_inflight"),
                 )
                 return (out_instance, out_endpoint, workload)
 

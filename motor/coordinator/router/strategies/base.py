@@ -287,9 +287,11 @@ class BaseRouter(ABC):
                 if _should_log_scheduling_sample(self.req_info.req_id):
                     self.logger.info(
                         "Scheduling role=%s allocated instance_id=%s endpoint_id=%s "
-                        "job=%s endpoint=%s:%s total_ms=%.2f",
+                        "job=%s endpoint=%s:%s active_requests=%s total_ms=%.2f",
                         role, ins.id, endpoint.id, ins.job_name,
-                        endpoint.ip, endpoint.business_port, elapsed_prepare_ms
+                        endpoint.ip, endpoint.business_port,
+                        getattr(endpoint.workload, "active_requests", None),
+                        elapsed_prepare_ms
                     )
                 self.logger.debug(
                     "Dispatch api=%s len=%d endpoint_status=%s model=%s",
@@ -333,6 +335,7 @@ class BaseRouter(ABC):
         rollback_workload = Workload(
             active_kv_cache=-allocate_workload.active_kv_cache,
             active_tokens=-allocate_workload.active_tokens,
+            active_requests=-allocate_workload.active_requests,
         )
         params = UpdateWorkloadParams(
             instance_id=instance.id,

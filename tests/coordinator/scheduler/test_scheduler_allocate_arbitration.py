@@ -462,3 +462,55 @@ async def test_allocate_only_fast_path_accepts_encode_candidate():
     assert selected_role == PDRole.ROLE_E
     assert selected_workload.active_tokens == 3
     assert workload_writer.writes == [(1, 10)]
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_tracks_and_returns_active_requests():
+    """ALLOCATE_ONLY should increment in-flight request counts and expose P/D totals."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.LOAD_BALANCE
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+
+    prefill = _make_prefill_instance(1, (10, 11), role=PDRole.ROLE_P)
+    decode = _make_prefill_instance(2, (20, 21), role=PDRole.ROLE_D)
+    await instance_manager.refresh_instances(EventType.ADD, [prefill, decode])
+    await instance_manager.update_instance_workload(
+        2, 20, Workload(active_requests=2)
+    )
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=_DummyWorkloadWriter(),
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-inflight",
+        data={
+            "instance_id": 1,
+            "endpoint_id": 10,
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-inflight",
+            "workload": Workload(
+                active_tokens=3, active_requests=1
+            ).model_dump(mode="json"),
+            "workload_sequence": 0,
+            "instance_version": 1,
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["instance"]["id"] == 1
+    assert response.data["endpoint"]["id"] == 10
+    assert response.data["active_requests"] == 1
+    assert response.data["prefill_inflight"] == 1
+    assert response.data["decode_inflight"] == 2
+    assert response.data["endpoint"]["workload"]["active_requests"] == 1
+    _, selected_workload = await instance_manager.get_endpoint_workload(1, 10)
+    assert selected_workload.active_requests == 1
+    assert selected_workload.active_tokens == 3

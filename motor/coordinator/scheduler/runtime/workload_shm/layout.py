@@ -2,6 +2,8 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#         http://license.coscl.org.cn/MulanPSL2
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
 # EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
@@ -25,7 +27,9 @@ from dataclasses import dataclass
 MAGIC = 0x574B4C44
 
 # Schema version for layout compatibility
-SCHEMA_VERSION = 1
+# v1: tokens + kv only (trailing 4B padding unused)
+# v2: trailing 4B stores active_requests (int32); entry size unchanged at 32B
+SCHEMA_VERSION = 2
 
 # Role mapping: prefill=0, decode=1, hybrid=2, encode=3
 ROLE_PREFILL = 0
@@ -43,9 +47,10 @@ HEARTBEAT_OFFSET = 32  # bytes 32-40: heartbeat_sequence (Q)
 HEARTBEAT_STALE_SEC = 5.0  # If heartbeat unchanged for this long, Infer treats shm as stale
 
 # Entry: 32 bytes
-# instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, active_kv_cache 8B, padding 4B
+# instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, active_kv_cache 8B,
+# active_requests 4B
 ENTRY_SIZE = 32
-ENTRY_FMT = "<i i B 3x d d 4x"
+ENTRY_FMT = "<i i B 3x d d i"
 
 # Max number of (instance, endpoint) workload entries in shared memory. Not user-configurable.
 DEFAULT_WORKLOAD_SHM_MAX_ENTRIES = 10240
@@ -60,6 +65,7 @@ class WorkloadShmEntry:
     role: int
     active_tokens: float
     active_kv_cache: float
+    active_requests: int = 0
 
 
 @dataclass(frozen=True)
@@ -121,6 +127,7 @@ def pack_entry(entry: WorkloadShmEntry) -> bytes:
         entry.role,
         entry.active_tokens,
         entry.active_kv_cache,
+        int(entry.active_requests),
     )
 
 
@@ -136,6 +143,7 @@ def unpack_entry(buf: memoryview, slot: int) -> WorkloadShmEntry:
         role=t[2],
         active_tokens=t[3],
         active_kv_cache=t[4],
+        active_requests=t[5],
     )
 
 

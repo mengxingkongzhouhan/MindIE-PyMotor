@@ -87,6 +87,9 @@ _KEY_INSTANCE_VERSION = "instance_version"
 _KEY_FAST_PATH = "fast_path"
 _KEY_CANDIDATE_POLICY = "candidate_policy"
 _KEY_CANDIDATES = "candidates"
+_KEY_ACTIVE_REQUESTS = "active_requests"
+_KEY_PREFILL_INFLIGHT = "prefill_inflight"
+_KEY_DECODE_INFLIGHT = "decode_inflight"
 
 
 def _should_log_scheduling_sample(sample_key: str) -> bool:
@@ -133,6 +136,10 @@ def _serialize_endpoint_minimal(endpoint: Endpoint | None) -> dict:
         "ip": endpoint.ip,
         "business_port": endpoint.business_port,
         "mgmt_port": getattr(endpoint, "mgmt_port", "") or "",
+        # Carry in-flight request count so Workers can log it after ALLOCATE_ONLY.
+        "workload": {
+            "active_requests": int(getattr(endpoint.workload, "active_requests", 0) or 0),
+        },
     }
     if hasattr(endpoint, "status") and endpoint.status is not None:
         out["status"] = endpoint.status.value if hasattr(endpoint.status, "value") else str(endpoint.status)
@@ -390,10 +397,17 @@ class _SchedulerRequestDispatcher:
             )
         instance_data = _serialize_instance_minimal(instance) if instance else None
         endpoint_data = _serialize_endpoint_minimal(endpoint) if endpoint else None
+        ep_active_requests = int(endpoint.workload.active_requests)
+        prefill_inflight = self._sum_role_active_requests(PDRole.ROLE_P)
+        decode_inflight = self._sum_role_active_requests(PDRole.ROLE_D)
         if _should_log_scheduling_sample(req_id or request.request_id):
             logger.info(
-                "ALLOCATE_ONLY req_id=%s ins=%s ep=%s score=%.4f fast_path=%s",
-                req_id, instance.id, endpoint.id, selected_score, fast_path,
+                "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "
+                "active_requests=%d prefill_inflight=%d decode_inflight=%d "
+                "score=%.4f fast_path=%s",
+                req_id, role.value, instance.id, endpoint.id,
+                ep_active_requests, prefill_inflight, decode_inflight,
+                selected_score, fast_path,
             )
         return SchedulerResponse(
             response_type=SchedulerResponseType.SUCCESS,
@@ -403,6 +417,9 @@ class _SchedulerRequestDispatcher:
                 _KEY_ENDPOINT: endpoint_data,
                 _KEY_SELECTED_SCORE: selected_score,
                 _KEY_FAST_PATH: fast_path,
+                _KEY_ACTIVE_REQUESTS: ep_active_requests,
+                _KEY_PREFILL_INFLIGHT: prefill_inflight,
+                _KEY_DECODE_INFLIGHT: decode_inflight,
             },
         )
 
@@ -415,6 +432,15 @@ class _SchedulerRequestDispatcher:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _sum_role_active_requests(self, role: PDRole) -> int:
+        """Sum in-flight request counts across all endpoints for a role pool."""
+        total = 0
+        for instance in self._instance_manager.get_available_instances(role).values():
+            for pod_eps in (instance.endpoints or {}).values():
+                for ep in (pod_eps or {}).values():
+                    total += int(getattr(ep.workload, "active_requests", 0) or 0)
+        return total
 
     @staticmethod
     def _extract_allocate_candidate(data: dict) -> tuple[int, int] | None:

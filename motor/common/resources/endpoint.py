@@ -23,7 +23,11 @@ class Workload(BaseModel):
     """Workload information for load balancing"""
 
     active_kv_cache: float = Field(default=0, description="Active KV cache size")
-    active_tokens: float = Field(default=0, description="Number of active requests")
+    active_tokens: float = Field(default=0, description="Active token / load score (not request count)")
+    active_requests: int = Field(
+        default=0,
+        description="In-flight request count on this endpoint for the allocated role",
+    )
 
     def __iadd__(self, other):
         if not isinstance(other, Workload):
@@ -31,6 +35,7 @@ class Workload(BaseModel):
 
         self.active_kv_cache += other.active_kv_cache
         self.active_tokens += other.active_tokens
+        self.active_requests += other.active_requests
 
         return self
 

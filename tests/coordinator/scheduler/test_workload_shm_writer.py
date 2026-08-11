@@ -80,12 +80,13 @@ class TestPdRoleToShmRole(unittest.TestCase):
 class TestCollectEntriesAndSlotMap(unittest.TestCase):
     """Test _collect_entries_and_slot_map helper."""
 
-    def _make_endpoint(self, eid, tokens, kv):
+    def _make_endpoint(self, eid, tokens, kv, active_requests=0):
         ep = MagicMock()
         ep.id = eid
         ep.workload = MagicMock()
         ep.workload.active_tokens = tokens
         ep.workload.active_kv_cache = kv
+        ep.workload.active_requests = active_requests
         return ep
 
     def _make_instance(self, iid, endpoints_dict):
@@ -133,13 +134,13 @@ class TestCollectEntriesAndSlotMap(unittest.TestCase):
         self.assertEqual(slot_map, {(1, 10): 0, (2, 20): 1, (3, 30): 2})
 
         self.assertEqual(
-            entries[0], (1, 10, ROLE_PREFILL, 100.0, 200.0),
+            entries[0], (1, 10, ROLE_PREFILL, 100.0, 200.0, 0),
         )
         self.assertEqual(
-            entries[1], (2, 20, ROLE_DECODE, 300.0, 400.0),
+            entries[1], (2, 20, ROLE_DECODE, 300.0, 400.0, 0),
         )
         self.assertEqual(
-            entries[2], (3, 30, ROLE_HYBRID, 500.0, 600.0),
+            entries[2], (3, 30, ROLE_HYBRID, 500.0, 600.0, 0),
         )
 
     # ---------------------------------------------------------------
@@ -239,6 +240,7 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
         mock_workload = MagicMock()
         mock_workload.active_tokens = 999.0
         mock_workload.active_kv_cache = 888.0
+        mock_workload.active_requests = 4
         im.get_endpoint_workload = AsyncMock(
             return_value=(PDRole.ROLE_P, mock_workload),
         )
@@ -260,6 +262,7 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
         self.assertEqual(entry_arg.role, ROLE_PREFILL)
         self.assertEqual(entry_arg.active_tokens, 999.0)
         self.assertEqual(entry_arg.active_kv_cache, 888.0)
+        self.assertEqual(entry_arg.active_requests, 4)
 
         # Header should be rewritten
         mock_wh.assert_called()

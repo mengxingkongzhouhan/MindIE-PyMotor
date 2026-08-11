@@ -34,6 +34,7 @@ class TestCalculateDemandWorkload:
         assert w.active_kv_cache > 0
         assert w.active_tokens > 0
         assert w.active_kv_cache == w.active_tokens
+        assert w.active_requests == 1
 
     def test_prefill_role_uses_real_tokens_when_present(self):
         """ROLE_P: when req_info.token_ids is set, load is the real token count (not req_len)."""
@@ -43,6 +44,7 @@ class TestCalculateDemandWorkload:
         w = calculate_demand_workload(PDRole.ROLE_P, req_info)
         assert w.active_tokens == 5.0
         assert w.active_kv_cache == 5.0
+        assert w.active_requests == 1
 
     def test_prefill_role_falls_back_when_token_ids_empty(self):
         """ROLE_P: empty/absent token_ids falls back to the legacy byte-length heuristic."""
@@ -53,6 +55,7 @@ class TestCalculateDemandWorkload:
         # Heuristic at req_len=4 -> ~120.1, definitely not len([])==0.
         assert w.active_tokens > 100
         assert w.active_kv_cache == w.active_tokens
+        assert w.active_requests == 1
 
     def test_decode_role(self):
         """ROLE_D: only active_tokens set (request_length)."""
@@ -61,6 +64,7 @@ class TestCalculateDemandWorkload:
         w = calculate_demand_workload(PDRole.ROLE_D, req_info)
         assert w.active_tokens == 10.0
         assert w.active_kv_cache == 0
+        assert w.active_requests == 1
 
     def test_encode_role_uses_tokens_without_kv_cache(self, monkeypatch):
         """ROLE_E: encode allocation should not leave KV cache workload to release."""
@@ -86,6 +90,7 @@ class TestCalculateDemandWorkload:
 
         assert w.active_tokens == 42
         assert w.active_kv_cache == 0
+        assert w.active_requests == 1
 
     def test_encode_video_role_uses_request_length(self):
         """ROLE_E video workload should use integer req_len without calling len(req_len)."""
@@ -108,6 +113,7 @@ class TestCalculateDemandWorkload:
 
         assert w.active_tokens == 320
         assert w.active_kv_cache == 0
+        assert w.active_requests == 1
 
     def test_hybrid_role(self):
         """ROLE_U: both set, average of prefill and decode scores."""
@@ -116,6 +122,7 @@ class TestCalculateDemandWorkload:
         w = calculate_demand_workload(PDRole.ROLE_U, req_info)
         assert w.active_kv_cache > 0
         assert w.active_tokens > 0
+        assert w.active_requests == 1
 
     def test_unknown_role_returns_empty_workload(self):
         """Unknown role returns empty Workload (and logs warning)."""
@@ -178,10 +185,49 @@ class TestWorkloadActionHandler:
         assert role == PDRole.ROLE_P
         assert workload_change is not None
         assert workload_change.active_tokens > 0
+        assert workload_change.active_requests == 1
         mock_request_manager.add_req_workload.assert_called_once()
         call_args = mock_request_manager.add_req_workload.call_args
         assert call_args[0][0] == "req-1"
         assert call_args[0][1] == PDRole.ROLE_P
+
+    @pytest.mark.asyncio
+    async def test_release_tokens_decrements_active_requests_when_fully_done(
+        self, mock_request_manager, valid_resource
+    ):
+        """RELEASE_TOKENS with no remaining KV also releases the in-flight request count."""
+        current = Workload(active_kv_cache=0.0, active_tokens=50.0, active_requests=1)
+        mock_request_manager.get_req_workload = AsyncMock(return_value=current)
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+        req_info.req_len = 4
+        workload_change, role = await handler.compute_and_update(
+            valid_resource, "req-1", WorkloadAction.RELEASE_TOKENS, req_info=req_info
+        )
+        assert role == PDRole.ROLE_P
+        assert workload_change is not None
+        assert workload_change.active_tokens == -50.0
+        assert workload_change.active_requests == -1
+        mock_request_manager.del_req_workload.assert_called_once_with("req-1", PDRole.ROLE_P)
+
+    @pytest.mark.asyncio
+    async def test_release_kv_keeps_active_requests_while_tokens_remain(
+        self, mock_request_manager, valid_resource
+    ):
+        """RELEASE_KV while tokens remain must not decrement in-flight request count."""
+        current = Workload(active_kv_cache=100.0, active_tokens=50.0, active_requests=1)
+        mock_request_manager.get_req_workload = AsyncMock(return_value=current)
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+        req_info.req_len = 4
+        workload_change, role = await handler.compute_and_update(
+            valid_resource, "req-1", WorkloadAction.RELEASE_KV, req_info=req_info
+        )
+        assert role == PDRole.ROLE_P
+        assert workload_change is not None
+        assert workload_change.active_kv_cache == -100.0
+        assert workload_change.active_requests == 0
+        mock_request_manager.del_req_workload.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_compute_and_update_allocation_duplicate_returns_none(self, mock_request_manager, valid_resource):
@@ -246,7 +292,7 @@ class TestWorkloadActionHandler:
             status=EndpointStatus.NORMAL,
         )
         resource = ScheduledResource(instance=instance, endpoint=endpoint)
-        current = Workload(active_tokens=42)
+        current = Workload(active_tokens=42, active_requests=1)
         mock_request_manager.get_req_workload = AsyncMock(return_value=current)
         handler = WorkloadActionHandler(mock_request_manager)
         req_info = MagicMock()
@@ -256,7 +302,7 @@ class TestWorkloadActionHandler:
         )
 
         assert role == PDRole.ROLE_E
-        assert workload_change == Workload(active_tokens=-42)
+        assert workload_change == Workload(active_tokens=-42, active_requests=-1)
         mock_request_manager.update_req_workload.assert_called_once()
         mock_request_manager.del_req_workload.assert_called_once_with("req-encode", PDRole.ROLE_E)
 
