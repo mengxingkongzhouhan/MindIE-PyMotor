@@ -287,10 +287,11 @@ class BaseRouter(ABC):
                 if _should_log_scheduling_sample(self.req_info.req_id):
                     self.logger.info(
                         "Scheduling role=%s allocated instance_id=%s endpoint_id=%s "
-                        "job=%s endpoint=%s:%s active_requests=%s total_ms=%.2f",
+                        "job=%s endpoint=%s:%s active_requests=%s active_tokens=%s total_ms=%.2f",
                         role, ins.id, endpoint.id, ins.job_name,
                         endpoint.ip, endpoint.business_port,
                         getattr(endpoint.workload, "active_requests", None),
+                        getattr(endpoint.workload, "active_tokens", None),
                         elapsed_prepare_ms
                     )
                 self.logger.debug(

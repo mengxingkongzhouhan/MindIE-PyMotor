@@ -88,6 +88,7 @@ _KEY_FAST_PATH = "fast_path"
 _KEY_CANDIDATE_POLICY = "candidate_policy"
 _KEY_CANDIDATES = "candidates"
 _KEY_ACTIVE_REQUESTS = "active_requests"
+_KEY_ACTIVE_TOKENS = "active_tokens"
 _KEY_PREFILL_ENDPOINTS = "prefill_endpoints"
 _KEY_DECODE_ENDPOINTS = "decode_endpoints"
 
@@ -97,11 +98,17 @@ def _should_log_scheduling_sample(sample_key: str) -> bool:
     return bool(sample_key) and hash(sample_key) % _SCHEDULING_LOG_SAMPLE_RATE == 0
 
 
-def _format_endpoint_active_requests(endpoint_counts: dict[str, int]) -> str:
-    """Format per-endpoint in-flight counts for logs: ins:ep=count,..."""
-    if not endpoint_counts:
+def _format_endpoint_workload(endpoint_stats: dict[str, dict[str, float | int]]) -> str:
+    """Format per-endpoint workload for logs: ins:ep=req:N,tokens:T,..."""
+    if not endpoint_stats:
         return "none"
-    return ",".join(f"{key}={count}" for key, count in endpoint_counts.items())
+    parts = []
+    for key, stats in endpoint_stats.items():
+        parts.append(
+            f"{key}=req:{int(stats.get('active_requests', 0))},"
+            f"tokens:{float(stats.get('active_tokens', 0.0)):.2f}"
+        )
+    return ";".join(parts)
 
 
 # ==================== Serialization (module-level, shared by Server / Broadcaster) ====================
@@ -144,9 +151,10 @@ def _serialize_endpoint_minimal(endpoint: Endpoint | None) -> dict:
         "ip": endpoint.ip,
         "business_port": endpoint.business_port,
         "mgmt_port": getattr(endpoint, "mgmt_port", "") or "",
-        # Carry in-flight request count so Workers can log it after ALLOCATE_ONLY.
+        # Carry workload snapshot so Workers can log it after ALLOCATE_ONLY.
         "workload": {
             "active_requests": int(getattr(endpoint.workload, "active_requests", 0) or 0),
+            "active_tokens": float(getattr(endpoint.workload, "active_tokens", 0.0) or 0.0),
         },
     }
     if hasattr(endpoint, "status") and endpoint.status is not None:
@@ -406,17 +414,19 @@ class _SchedulerRequestDispatcher:
         instance_data = _serialize_instance_minimal(instance) if instance else None
         endpoint_data = _serialize_endpoint_minimal(endpoint) if endpoint else None
         ep_active_requests = int(endpoint.workload.active_requests)
-        prefill_endpoints = self._role_endpoint_active_requests(PDRole.ROLE_P)
-        decode_endpoints = self._role_endpoint_active_requests(PDRole.ROLE_D)
+        ep_active_tokens = float(endpoint.workload.active_tokens)
+        prefill_endpoints = self._role_endpoint_workload(PDRole.ROLE_P)
+        decode_endpoints = self._role_endpoint_workload(PDRole.ROLE_D)
         if _should_log_scheduling_sample(req_id or request.request_id):
             logger.info(
                 "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "
-                "active_requests=%d prefill_endpoints=%s decode_endpoints=%s "
+                "active_requests=%d active_tokens=%.2f "
+                "prefill_endpoints=%s decode_endpoints=%s "
                 "score=%.4f fast_path=%s",
                 req_id, role.value, instance.id, endpoint.id,
-                ep_active_requests,
-                _format_endpoint_active_requests(prefill_endpoints),
-                _format_endpoint_active_requests(decode_endpoints),
+                ep_active_requests, ep_active_tokens,
+                _format_endpoint_workload(prefill_endpoints),
+                _format_endpoint_workload(decode_endpoints),
                 selected_score, fast_path,
             )
         return SchedulerResponse(
@@ -428,6 +438,7 @@ class _SchedulerRequestDispatcher:
                 _KEY_SELECTED_SCORE: selected_score,
                 _KEY_FAST_PATH: fast_path,
                 _KEY_ACTIVE_REQUESTS: ep_active_requests,
+                _KEY_ACTIVE_TOKENS: ep_active_tokens,
                 _KEY_PREFILL_ENDPOINTS: prefill_endpoints,
                 _KEY_DECODE_ENDPOINTS: decode_endpoints,
             },
@@ -443,15 +454,22 @@ class _SchedulerRequestDispatcher:
         except (TypeError, ValueError):
             return None
 
-    def _role_endpoint_active_requests(self, role: PDRole) -> dict[str, int]:
-        """Per-endpoint in-flight request counts for a role pool: {\"ins:ep\": count}."""
-        counts: dict[str, int] = {}
+    def _role_endpoint_workload(self, role: PDRole) -> dict[str, dict[str, float | int]]:
+        """Per-endpoint workload snapshot for a role pool: {\"ins:ep\": {active_requests, active_tokens}}."""
+        stats: dict[str, dict[str, float | int]] = {}
         for instance in self._instance_manager.get_available_instances(role).values():
             for pod_eps in (instance.endpoints or {}).values():
                 for ep in (pod_eps or {}).values():
                     key = f"{instance.id}:{ep.id}"
-                    counts[key] = int(getattr(ep.workload, "active_requests", 0) or 0)
-        return counts
+                    stats[key] = {
+                        "active_requests": int(
+                            getattr(ep.workload, "active_requests", 0) or 0
+                        ),
+                        "active_tokens": float(
+                            getattr(ep.workload, "active_tokens", 0.0) or 0.0
+                        ),
+                    }
+        return stats
 
     @staticmethod
     def _extract_allocate_candidate(data: dict) -> tuple[int, int] | None:
