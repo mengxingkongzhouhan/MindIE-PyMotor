@@ -72,9 +72,6 @@ def _create_workload_shared_memory(shared_memory_mod, shm_name: str, shm_size: i
         return shared_memory_mod.SharedMemory(name=shm_name, create=True, size=shm_size)
 
 
-# Hot-path scheduling log sampling: ~1% of requests to reduce I/O and CPU at high QPS
-_SCHEDULING_LOG_SAMPLE_RATE = 100
-
 # Display string for unknown/hybrid role in logs
 _ROLE_DISPLAY_HYBRID = "hybrid"
 
@@ -91,11 +88,6 @@ _KEY_ACTIVE_REQUESTS = "active_requests"
 _KEY_ACTIVE_TOKENS = "active_tokens"
 _KEY_PREFILL_ENDPOINTS = "prefill_endpoints"
 _KEY_DECODE_ENDPOINTS = "decode_endpoints"
-
-
-def _should_log_scheduling_sample(sample_key: str) -> bool:
-    """Return True for ~1/_SCHEDULING_LOG_SAMPLE_RATE of requests (hot-path info sampling)."""
-    return bool(sample_key) and hash(sample_key) % _SCHEDULING_LOG_SAMPLE_RATE == 0
 
 
 def _format_endpoint_workload(endpoint_stats: dict[str, dict[str, float | int]]) -> str:
@@ -417,18 +409,18 @@ class _SchedulerRequestDispatcher:
         ep_active_tokens = float(endpoint.workload.active_tokens)
         prefill_endpoints = self._role_endpoint_workload(PDRole.ROLE_P)
         decode_endpoints = self._role_endpoint_workload(PDRole.ROLE_D)
-        if _should_log_scheduling_sample(req_id or request.request_id):
-            logger.info(
-                "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "
-                "active_requests=%d active_tokens=%.2f "
-                "prefill_endpoints=%s decode_endpoints=%s "
-                "score=%.4f fast_path=%s",
-                req_id, role.value, instance.id, endpoint.id,
-                ep_active_requests, ep_active_tokens,
-                _format_endpoint_workload(prefill_endpoints),
-                _format_endpoint_workload(decode_endpoints),
-                selected_score, fast_path,
-            )
+        # Always log every allocate (needed for per-request endpoint workload tables).
+        logger.info(
+            "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "
+            "active_requests=%d active_tokens=%.2f "
+            "prefill_endpoints=%s decode_endpoints=%s "
+            "score=%.4f fast_path=%s",
+            req_id, role.value, instance.id, endpoint.id,
+            ep_active_requests, ep_active_tokens,
+            _format_endpoint_workload(prefill_endpoints),
+            _format_endpoint_workload(decode_endpoints),
+            selected_score, fast_path,
+        )
         return SchedulerResponse(
             response_type=SchedulerResponseType.SUCCESS,
             request_id=request.request_id,

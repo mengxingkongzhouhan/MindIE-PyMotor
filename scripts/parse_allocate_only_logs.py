@@ -10,10 +10,12 @@ Parses lines like:
   prefill_endpoints=1:10=req:3,tokens:128.45;1:11=req:1,tokens:40.00
   decode_endpoints=2:20=req:5,tokens:200.00 score=... fast_path=...
 
+Rows are sorted by processing order (log appearance order across input files).
+
 Usage:
   python3 scripts/parse_allocate_only_logs.py coordinator.log
+  python3 scripts/parse_allocate_only_logs.py 'log/vllm-0-coordinator-*' --per-endpoint
   python3 scripts/parse_allocate_only_logs.py coordinator.log --format csv -o out.csv
-  python3 scripts/parse_allocate_only_logs.py coordinator.log --per-endpoint
   cat coordinator.log | python3 scripts/parse_allocate_only_logs.py -
 """
 
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import re
 import sys
 from dataclasses import dataclass
@@ -47,6 +50,7 @@ _ENDPOINT_STAT_RE = re.compile(
 )
 
 _SUMMARY_COLUMNS = [
+    "seq",
     "req_id",
     "role",
     "ins",
@@ -60,6 +64,7 @@ _SUMMARY_COLUMNS = [
 ]
 
 _PER_ENDPOINT_COLUMNS = [
+    "seq",
     "req_id",
     "role",
     "selected_ins",
@@ -74,6 +79,8 @@ _PER_ENDPOINT_COLUMNS = [
     "score",
     "fast_path",
 ]
+
+_POOL_ORDER = {"prefill": 0, "decode": 1}
 
 
 @dataclass(frozen=True)
@@ -112,17 +119,43 @@ def parse_allocate_line(line: str) -> dict[str, str] | None:
     return match.groupdict()
 
 
-def iter_log_lines(paths: list[str]) -> Iterable[str]:
+def expand_log_paths(paths: list[str]) -> list[str]:
+    """Expand shell-style globs; keep stdin marker '-' as-is."""
     if not paths or paths == ["-"]:
-        yield from sys.stdin
-        return
+        return ["-"]
+    expanded: list[str] = []
     for path in paths:
+        if path == "-":
+            expanded.append(path)
+            continue
+        matches = sorted(glob.glob(path))
+        if matches:
+            expanded.extend(matches)
+        else:
+            # Allow nonexistent path to surface later as open error / empty.
+            expanded.append(path)
+    return expanded
+
+
+def iter_log_lines(paths: list[str]) -> Iterable[tuple[str, int, str]]:
+    """Yield (source, line_no, line) in file order."""
+    resolved = expand_log_paths(paths)
+    if resolved == ["-"]:
+        for line_no, line in enumerate(sys.stdin, start=1):
+            yield ("-", line_no, line)
+        return
+    for path in resolved:
         with Path(path).open("r", encoding="utf-8", errors="replace") as fh:
-            yield from fh
+            for line_no, line in enumerate(fh, start=1):
+                yield (path, line_no, line)
 
 
 def build_summary_rows(records: list[dict[str, str]]) -> list[dict[str, str]]:
-    return [{col: rec.get(col, "") for col in _SUMMARY_COLUMNS} for rec in records]
+    rows = []
+    for rec in records:
+        row = {col: rec.get(col, "") for col in _SUMMARY_COLUMNS}
+        rows.append(row)
+    return rows
 
 
 def build_per_endpoint_rows(records: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -136,6 +169,7 @@ def build_per_endpoint_rows(records: list[dict[str, str]]) -> list[dict[str, str
             if not stats:
                 rows.append(
                     {
+                        "seq": rec.get("seq", ""),
                         "req_id": rec.get("req_id", ""),
                         "role": rec.get("role", ""),
                         "selected_ins": rec.get("ins", ""),
@@ -152,9 +186,17 @@ def build_per_endpoint_rows(records: list[dict[str, str]]) -> list[dict[str, str
                     }
                 )
                 continue
-            for stat in stats:
+            # Stable order within one allocate snapshot: ins/ep numeric when possible.
+            def _sort_key(stat: EndpointStat) -> tuple:
+                try:
+                    return (int(stat.ins), int(stat.ep))
+                except ValueError:
+                    return (stat.ins, stat.ep)
+
+            for stat in sorted(stats, key=_sort_key):
                 rows.append(
                     {
+                        "seq": rec.get("seq", ""),
                         "req_id": rec.get("req_id", ""),
                         "role": rec.get("role", ""),
                         "selected_ins": rec.get("ins", ""),
@@ -170,7 +212,23 @@ def build_per_endpoint_rows(records: list[dict[str, str]]) -> list[dict[str, str
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
+    # Keep allocate processing order (seq), then pool, then endpoint.
+    rows.sort(
+        key=lambda r: (
+            int(r.get("seq") or 0),
+            _POOL_ORDER.get(r.get("pool", ""), 99),
+            _safe_int(r.get("ins", "")),
+            _safe_int(r.get("ep", "")),
+        )
+    )
     return rows
+
+
+def _safe_int(value: str) -> tuple[int, str]:
+    try:
+        return (0, str(int(value)))
+    except (TypeError, ValueError):
+        return (1, value or "")
 
 
 def render_markdown(columns: list[str], rows: list[dict[str, str]], out: TextIO) -> None:
@@ -210,13 +268,16 @@ def render_table(columns: list[str], rows: list[dict[str, str]], out: TextIO) ->
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Filter ALLOCATE_ONLY logs into a table of endpoint workload data."
+        description=(
+            "Filter ALLOCATE_ONLY logs into a table. "
+            "Every matched allocate is emitted in processing order."
+        )
     )
     parser.add_argument(
         "logs",
         nargs="*",
         default=["-"],
-        help="Log file path(s). Use - or omit for stdin.",
+        help="Log file path(s) or globs. Use - or omit for stdin.",
     )
     parser.add_argument(
         "--per-endpoint",
@@ -237,10 +298,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     records: list[dict[str, str]] = []
-    for line in iter_log_lines(args.logs):
+    seq = 0
+    for _source, _line_no, line in iter_log_lines(args.logs):
         parsed = parse_allocate_line(line)
-        if parsed:
-            records.append(parsed)
+        if not parsed:
+            continue
+        seq += 1
+        parsed["seq"] = str(seq)
+        records.append(parsed)
+
+    # Processing order = log appearance order (seq already assigned).
+    # Secondary sort by req_id keeps ties stable if inputs are merged oddly.
+    records.sort(key=lambda r: (int(r["seq"]), r.get("req_id", ""), r.get("role", "")))
 
     if args.per_endpoint:
         columns = _PER_ENDPOINT_COLUMNS
