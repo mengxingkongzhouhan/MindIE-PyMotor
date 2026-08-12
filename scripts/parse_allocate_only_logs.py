@@ -64,7 +64,6 @@ _SUMMARY_COLUMNS = [
     "active_kv_cache",
     "prefill_endpoints",
     "decode_endpoints",
-    "score",
     "fast_path",
 ]
 
@@ -84,7 +83,6 @@ _PER_ENDPOINT_COLUMNS = [
     "selected_active_requests",
     "selected_active_tokens",
     "selected_active_kv_cache",
-    "score",
     "fast_path",
 ]
 
@@ -211,7 +209,6 @@ def build_per_endpoint_rows(
                         "selected_active_requests": rec.get("active_requests", ""),
                         "selected_active_tokens": rec.get("active_tokens", ""),
                         "selected_active_kv_cache": rec.get("active_kv_cache", ""),
-                        "score": rec.get("score", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
@@ -245,7 +242,6 @@ def build_per_endpoint_rows(
                         "selected_active_requests": rec.get("active_requests", ""),
                         "selected_active_tokens": rec.get("active_tokens", ""),
                         "selected_active_kv_cache": rec.get("active_kv_cache", ""),
-                        "score": rec.get("score", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
