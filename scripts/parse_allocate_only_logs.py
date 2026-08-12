@@ -11,6 +11,8 @@ Parses lines like:
   decode_endpoints=2:20=req:5,tokens:200.00,kv:0.00 score=... fast_path=...
 
 Rows are sorted by processing order (log appearance order across input files).
+Per-endpoint active_* / lb_score are reconstructed as pre-allocation load on the
+selected endpoint; selected_active_* stay post-allocation and only on that row.
 
 Usage:
   python3 scripts/parse_allocate_only_logs.py coordinator.log --per-endpoint
@@ -102,6 +104,66 @@ def _prefill_lb_score(tokens: float, kv: float) -> float:
     return tokens + 0.3 * kv
 
 
+def _parse_float(value: str, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_int(value: str, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _recover_pre_alloc(
+    role: str,
+    post_req: int,
+    post_tokens: float,
+    post_kv: float,
+    score_raw: str,
+) -> tuple[int, float, float]:
+    """
+    Recover decision-time (pre-allocation) load for the selected endpoint.
+
+    ALLOCATE_ONLY logs are post-allocation. Prefill/union allocate adds the same demand D
+    to tokens and kv; decode/encode add tokens only. We estimate D as:
+      1) If log score>0 (pre-alloc lb): invert tokens+0.3*kv (prefill) or tokens (decode)
+      2) Else if tokens < kv (PD token-release asymmetry): D = tokens
+      3) Else equal-share fallback: D = tokens / post_req
+    """
+    pre_req = max(0, post_req - 1)
+    score = _parse_float(score_raw, default=0.0) if score_raw not in ("", None) else 0.0
+    role = (role or "").lower()
+
+    if role in ("prefill", "union", "both"):
+        post_lb = _prefill_lb_score(post_tokens, post_kv)
+        if score > 1e-9:
+            # score is pre-alloc lb: post_lb - score = 1.3 * D
+            demand = (post_lb - score) / 1.3
+        elif post_tokens + 1e-6 < post_kv:
+            # Prior RELEASE_TOKENS left orphan kv; remaining tokens ≈ this allocate.
+            demand = post_tokens
+        elif post_req > 0:
+            demand = post_tokens / float(post_req)
+        else:
+            demand = 0.0
+        demand = max(0.0, min(demand, post_tokens, post_kv))
+        return pre_req, max(0.0, post_tokens - demand), max(0.0, post_kv - demand)
+
+    # decode / encode: demand is tokens-only
+    if score > 1e-9:
+        demand = post_tokens - score
+    elif post_req > 0:
+        demand = post_tokens / float(post_req)
+    else:
+        demand = 0.0
+    demand = max(0.0, min(demand, post_tokens))
+    return pre_req, max(0.0, post_tokens - demand), post_kv
+
+
 def parse_endpoint_stats(blob: str) -> list[EndpointStat]:
     """Parse endpoint snapshot blob; kv is optional for older logs."""
     if not blob or blob == "none":
@@ -178,12 +240,26 @@ def build_per_endpoint_rows(
     records: list[dict[str, str]],
     pools: tuple[str, ...] = ("prefill", "decode"),
 ) -> list[dict[str, str]]:
+    """
+    Expand each ALLOCATE_ONLY into per-endpoint rows.
+
+    active_* / lb_score are reconstructed as pre-allocation (decision-time) load:
+    non-selected endpoints are unchanged; the selected endpoint subtracts the just-allocated
+    demand estimated from the post-alloc snapshot (+ optional log score).
+    selected_active_* remain post-allocation and only on the chosen endpoint row.
+    """
     rows: list[dict[str, str]] = []
     pool_blobs = {
         "prefill": "prefill_endpoints",
         "decode": "decode_endpoints",
     }
     for rec in records:
+        selected_ins = rec.get("ins", "")
+        selected_ep = rec.get("ep", "")
+        role = rec.get("role", "")
+        post_req = _parse_int(rec.get("active_requests", ""), default=0)
+        post_tokens = _parse_float(rec.get("active_tokens", ""), default=0.0)
+        post_kv = _parse_float(rec.get("active_kv_cache", ""), default=0.0)
         for pool in pools:
             blob_key = pool_blobs.get(pool)
             if not blob_key:
@@ -195,9 +271,9 @@ def build_per_endpoint_rows(
                     {
                         "seq": rec.get("seq", ""),
                         "req_id": rec.get("req_id", ""),
-                        "role": rec.get("role", ""),
+                        "role": role,
                         "selected_ins": "",
-                        "selected_ep": rec.get("ep", ""),
+                        "selected_ep": selected_ep,
                         "pool": pool,
                         "ins": "",
                         "ep": "",
@@ -218,17 +294,26 @@ def build_per_endpoint_rows(
                 except ValueError:
                     return (stat.ins, stat.ep)
 
-            selected_ins = rec.get("ins", "")
-            selected_ep = rec.get("ep", "")
             for stat in sorted(stats, key=_sort_key):
                 is_selected = (
                     str(stat.ins) == str(selected_ins) and str(stat.ep) == str(selected_ep)
                 )
+                req = stat.active_requests
+                tokens = stat.active_tokens
+                kv = stat.active_kv_cache
+                if is_selected:
+                    req, tokens, kv = _recover_pre_alloc(
+                        role,
+                        post_req=stat.active_requests,
+                        post_tokens=stat.active_tokens,
+                        post_kv=stat.active_kv_cache,
+                        score_raw=rec.get("score", ""),
+                    )
                 rows.append(
                     {
                         "seq": rec.get("seq", ""),
                         "req_id": rec.get("req_id", ""),
-                        "role": rec.get("role", ""),
+                        "role": role,
                         # Only fill selected_ins on rows belonging to the chosen instance.
                         "selected_ins": (
                             selected_ins if str(stat.ins) == str(selected_ins) else ""
@@ -237,11 +322,11 @@ def build_per_endpoint_rows(
                         "pool": pool,
                         "ins": stat.ins,
                         "ep": stat.ep,
-                        "active_requests": str(stat.active_requests),
-                        "active_tokens": f"{stat.active_tokens:.2f}",
-                        "active_kv_cache": f"{stat.active_kv_cache:.2f}",
-                        "lb_score": f"{_prefill_lb_score(stat.active_tokens, stat.active_kv_cache):.2f}",
-                        # Only fill selected_active_* on the chosen endpoint row.
+                        "active_requests": str(req),
+                        "active_tokens": f"{tokens:.2f}",
+                        "active_kv_cache": f"{kv:.2f}",
+                        "lb_score": f"{_prefill_lb_score(tokens, kv):.2f}",
+                        # Only fill selected_active_* on the chosen endpoint row (post-alloc).
                         "selected_active_requests": (
                             rec.get("active_requests", "") if is_selected else ""
                         ),
