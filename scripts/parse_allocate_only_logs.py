@@ -205,8 +205,8 @@ def build_per_endpoint_rows(
                         "active_tokens": "",
                         "active_kv_cache": "",
                         "lb_score": "",
-                        "selected_active_requests": rec.get("active_requests", ""),
-                        "selected_active_tokens": rec.get("active_tokens", ""),
+                        "selected_active_requests": "",
+                        "selected_active_tokens": "",
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
