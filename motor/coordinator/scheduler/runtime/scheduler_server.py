@@ -86,19 +86,21 @@ _KEY_CANDIDATE_POLICY = "candidate_policy"
 _KEY_CANDIDATES = "candidates"
 _KEY_ACTIVE_REQUESTS = "active_requests"
 _KEY_ACTIVE_TOKENS = "active_tokens"
+_KEY_ACTIVE_KV_CACHE = "active_kv_cache"
 _KEY_PREFILL_ENDPOINTS = "prefill_endpoints"
 _KEY_DECODE_ENDPOINTS = "decode_endpoints"
 
 
 def _format_endpoint_workload(endpoint_stats: dict[str, dict[str, float | int]]) -> str:
-    """Format per-endpoint workload for logs: ins:ep=req:N,tokens:T,..."""
+    """Format per-endpoint workload for logs: ins:ep=req:N,tokens:T,kv:K;..."""
     if not endpoint_stats:
         return "none"
     parts = []
     for key, stats in endpoint_stats.items():
         parts.append(
             f"{key}=req:{int(stats.get('active_requests', 0))},"
-            f"tokens:{float(stats.get('active_tokens', 0.0)):.2f}"
+            f"tokens:{float(stats.get('active_tokens', 0.0)):.2f},"
+            f"kv:{float(stats.get('active_kv_cache', 0.0)):.2f}"
         )
     return ";".join(parts)
 
@@ -147,6 +149,9 @@ def _serialize_endpoint_minimal(endpoint: Endpoint | None) -> dict:
         "workload": {
             "active_requests": int(getattr(endpoint.workload, "active_requests", 0) or 0),
             "active_tokens": float(getattr(endpoint.workload, "active_tokens", 0.0) or 0.0),
+            "active_kv_cache": float(
+                getattr(endpoint.workload, "active_kv_cache", 0.0) or 0.0
+            ),
         },
     }
     if hasattr(endpoint, "status") and endpoint.status is not None:
@@ -407,16 +412,17 @@ class _SchedulerRequestDispatcher:
         endpoint_data = _serialize_endpoint_minimal(endpoint) if endpoint else None
         ep_active_requests = int(endpoint.workload.active_requests)
         ep_active_tokens = float(endpoint.workload.active_tokens)
+        ep_active_kv_cache = float(endpoint.workload.active_kv_cache)
         prefill_endpoints = self._role_endpoint_workload(PDRole.ROLE_P)
         decode_endpoints = self._role_endpoint_workload(PDRole.ROLE_D)
         # Always log every allocate (needed for per-request endpoint workload tables).
         logger.info(
             "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "
-            "active_requests=%d active_tokens=%.2f "
+            "active_requests=%d active_tokens=%.2f active_kv_cache=%.2f "
             "prefill_endpoints=%s decode_endpoints=%s "
             "score=%.4f fast_path=%s",
             req_id, role.value, instance.id, endpoint.id,
-            ep_active_requests, ep_active_tokens,
+            ep_active_requests, ep_active_tokens, ep_active_kv_cache,
             _format_endpoint_workload(prefill_endpoints),
             _format_endpoint_workload(decode_endpoints),
             selected_score, fast_path,
@@ -431,6 +437,7 @@ class _SchedulerRequestDispatcher:
                 _KEY_FAST_PATH: fast_path,
                 _KEY_ACTIVE_REQUESTS: ep_active_requests,
                 _KEY_ACTIVE_TOKENS: ep_active_tokens,
+                _KEY_ACTIVE_KV_CACHE: ep_active_kv_cache,
                 _KEY_PREFILL_ENDPOINTS: prefill_endpoints,
                 _KEY_DECODE_ENDPOINTS: decode_endpoints,
             },
@@ -447,7 +454,7 @@ class _SchedulerRequestDispatcher:
             return None
 
     def _role_endpoint_workload(self, role: PDRole) -> dict[str, dict[str, float | int]]:
-        """Per-endpoint workload snapshot for a role pool: {\"ins:ep\": {active_requests, active_tokens}}."""
+        """Per-endpoint workload snapshot: {\"ins:ep\": {active_requests, active_tokens, active_kv_cache}}."""
         stats: dict[str, dict[str, float | int]] = {}
         for instance in self._instance_manager.get_available_instances(role).values():
             for pod_eps in (instance.endpoints or {}).values():
@@ -459,6 +466,9 @@ class _SchedulerRequestDispatcher:
                         ),
                         "active_tokens": float(
                             getattr(ep.workload, "active_tokens", 0.0) or 0.0
+                        ),
+                        "active_kv_cache": float(
+                            getattr(ep.workload, "active_kv_cache", 0.0) or 0.0
                         ),
                     }
         return stats

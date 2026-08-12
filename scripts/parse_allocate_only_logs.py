@@ -6,9 +6,9 @@ Filter ALLOCATE_ONLY scheduling logs into a table.
 
 Parses lines like:
   ALLOCATE_ONLY req_id=... role=prefill ins=1 ep=10
-  active_requests=3 active_tokens=128.45
-  prefill_endpoints=1:10=req:3,tokens:128.45;1:11=req:1,tokens:40.00
-  decode_endpoints=2:20=req:5,tokens:200.00 score=... fast_path=...
+  active_requests=3 active_tokens=128.45 active_kv_cache=128.45
+  prefill_endpoints=1:10=req:3,tokens:128.45,kv:128.45;1:11=req:1,tokens:40.00,kv:200.00
+  decode_endpoints=2:20=req:5,tokens:200.00,kv:0.00 score=... fast_path=...
 
 Rows are sorted by processing order (log appearance order across input files).
 
@@ -40,14 +40,17 @@ _ALLOCATE_RE = re.compile(
     r"ep=(?P<ep>\S+)\s+"
     r"active_requests=(?P<active_requests>\S+)\s+"
     r"active_tokens=(?P<active_tokens>\S+)\s+"
+    r"(?:active_kv_cache=(?P<active_kv_cache>\S+)\s+)?"
     r"prefill_endpoints=(?P<prefill_endpoints>\S+)\s+"
     r"decode_endpoints=(?P<decode_endpoints>\S+)\s+"
     r"score=(?P<score>\S+)\s+"
     r"fast_path=(?P<fast_path>\S+)"
 )
 
+# New: req:N,tokens:T,kv:K  |  Old (compat): req:N,tokens:T
 _ENDPOINT_STAT_RE = re.compile(
     r"(?P<ins_ep>[^=;]+)=req:(?P<req>-?\d+),tokens:(?P<tokens>-?\d+(?:\.\d+)?)"
+    r"(?:,kv:(?P<kv>-?\d+(?:\.\d+)?))?"
 )
 
 _SUMMARY_COLUMNS = [
@@ -58,6 +61,7 @@ _SUMMARY_COLUMNS = [
     "ep",
     "active_requests",
     "active_tokens",
+    "active_kv_cache",
     "prefill_endpoints",
     "decode_endpoints",
     "score",
@@ -75,8 +79,11 @@ _PER_ENDPOINT_COLUMNS = [
     "ep",
     "active_requests",
     "active_tokens",
+    "active_kv_cache",
+    "lb_score",
     "selected_active_requests",
     "selected_active_tokens",
+    "selected_active_kv_cache",
     "score",
     "fast_path",
 ]
@@ -90,10 +97,16 @@ class EndpointStat:
     ep: str
     active_requests: int
     active_tokens: float
+    active_kv_cache: float
+
+
+def _prefill_lb_score(tokens: float, kv: float) -> float:
+    """Same formula as Workload.calculate_workload_score for prefill."""
+    return tokens + 0.3 * kv
 
 
 def parse_endpoint_stats(blob: str) -> list[EndpointStat]:
-    """Parse '1:10=req:3,tokens:128.45;1:11=req:1,tokens:40.00' or 'none'."""
+    """Parse endpoint snapshot blob; kv is optional for older logs."""
     if not blob or blob == "none":
         return []
     stats: list[EndpointStat] = []
@@ -102,12 +115,14 @@ def parse_endpoint_stats(blob: str) -> list[EndpointStat]:
         if ":" not in ins_ep:
             continue
         ins, ep = ins_ep.split(":", 1)
+        kv_raw = match.group("kv")
         stats.append(
             EndpointStat(
                 ins=ins,
                 ep=ep,
                 active_requests=int(match.group("req")),
                 active_tokens=float(match.group("tokens")),
+                active_kv_cache=float(kv_raw) if kv_raw is not None else 0.0,
             )
         )
     return stats
@@ -117,7 +132,10 @@ def parse_allocate_line(line: str) -> dict[str, str] | None:
     match = _ALLOCATE_RE.search(line)
     if not match:
         return None
-    return match.groupdict()
+    data = match.groupdict()
+    if data.get("active_kv_cache") is None:
+        data["active_kv_cache"] = ""
+    return data
 
 
 def expand_log_paths(paths: list[str]) -> list[str]:
@@ -188,8 +206,11 @@ def build_per_endpoint_rows(
                         "ep": "",
                         "active_requests": "",
                         "active_tokens": "",
+                        "active_kv_cache": "",
+                        "lb_score": "",
                         "selected_active_requests": rec.get("active_requests", ""),
                         "selected_active_tokens": rec.get("active_tokens", ""),
+                        "selected_active_kv_cache": rec.get("active_kv_cache", ""),
                         "score": rec.get("score", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }
@@ -215,8 +236,11 @@ def build_per_endpoint_rows(
                         "ep": stat.ep,
                         "active_requests": str(stat.active_requests),
                         "active_tokens": f"{stat.active_tokens:.2f}",
+                        "active_kv_cache": f"{stat.active_kv_cache:.2f}",
+                        "lb_score": f"{_prefill_lb_score(stat.active_tokens, stat.active_kv_cache):.2f}",
                         "selected_active_requests": rec.get("active_requests", ""),
                         "selected_active_tokens": rec.get("active_tokens", ""),
+                        "selected_active_kv_cache": rec.get("active_kv_cache", ""),
                         "score": rec.get("score", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }
