@@ -93,7 +93,6 @@ _PER_ENDPOINT_COLUMNS = [
     "selected_active_requests",
     "selected_active_tokens",
     "selected_active_kv_cache",
-    "selected_matched_tokens",
     "fast_path",
 ]
 
@@ -198,12 +197,13 @@ def build_per_endpoint_rows(
     """
     Expand each ALLOCATE_ONLY record into per-endpoint rows.
 
-    Semantics (with updated coordinator logs):
-      - active_* / lb_score: pre-allocation snapshot from endpoint blobs
-      - selected_active_*: post-allocation values of the selected endpoint, only on that
-        endpoint's row; other rows are 0
-    For older post-allocation blobs, reconstruct pre-allocation on the selected endpoint by
-    subtracting the observed post-allocation delta (top-level selected - blob selected).
+    Logs remain post-allocation. This parser reconstructs a decision-time view:
+      - active_* / lb_score: pre-allocation estimate from endpoint blobs
+        (on the selected endpoint, subtract the just-allocated request; if that
+        leaves req=0, also clear tokens/kv)
+      - selected_active_*: post-allocation values of the selected endpoint only;
+        other rows are 0
+      - score is omitted from the table
     """
     rows: list[dict[str, str]] = []
     pool_blobs = {
@@ -243,7 +243,6 @@ def build_per_endpoint_rows(
                         "selected_active_requests": "0",
                         "selected_active_tokens": "0.00",
                         "selected_active_kv_cache": "0.00",
-                        "selected_matched_tokens": "0" if post_match != "" else "",
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
@@ -305,11 +304,6 @@ def build_per_endpoint_rows(
                         ),
                         "selected_active_kv_cache": (
                             f"{post_kv:.2f}" if is_selected else "0.00"
-                        ),
-                        "selected_matched_tokens": (
-                            (post_match if post_match != "" else "0") if is_selected else (
-                                "0" if post_match != "" else ""
-                            )
                         ),
                         "fast_path": rec.get("fast_path", ""),
                     }
