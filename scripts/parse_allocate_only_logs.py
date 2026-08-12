@@ -82,7 +82,6 @@ _PER_ENDPOINT_COLUMNS = [
     "lb_score",
     "selected_active_requests",
     "selected_active_tokens",
-    "selected_active_kv_cache",
     "fast_path",
 ]
 
@@ -208,7 +207,6 @@ def build_per_endpoint_rows(
                         "lb_score": "",
                         "selected_active_requests": rec.get("active_requests", ""),
                         "selected_active_tokens": rec.get("active_tokens", ""),
-                        "selected_active_kv_cache": rec.get("active_kv_cache", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
@@ -241,7 +239,6 @@ def build_per_endpoint_rows(
                         "lb_score": f"{_prefill_lb_score(stat.active_tokens, stat.active_kv_cache):.2f}",
                         "selected_active_requests": rec.get("active_requests", ""),
                         "selected_active_tokens": rec.get("active_tokens", ""),
-                        "selected_active_kv_cache": rec.get("active_kv_cache", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
