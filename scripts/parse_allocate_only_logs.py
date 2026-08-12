@@ -10,9 +10,11 @@ Parses lines like:
   prefill_endpoints=1:10=req:2,tokens:100.00,kv:100.00,match:64;1:11=req:1,tokens:40.00,kv:200.00,match:0
   decode_endpoints=2:20=req:5,tokens:200.00,kv:0.00 score=... fast_path=...
 
-Per-endpoint table semantics:
-  - active_* / lb_score: load before this allocate (decision-time)
+Per-endpoint table semantics (parser-only; logs stay post-allocation):
+  - active_* / lb_score: reconstructed pre-allocate load (selected endpoint: req-1,
+    and tokens/kv cleared when that leaves req=0; other endpoints unchanged)
   - selected_active_*: post-allocate load of the selected endpoint only (other rows are 0)
+  - score column removed
 
 Rows are sorted by processing order (log appearance order across input files).
 
