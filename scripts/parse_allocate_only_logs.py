@@ -6,15 +6,9 @@ Filter ALLOCATE_ONLY scheduling logs into a table.
 
 Parses lines like:
   ALLOCATE_ONLY req_id=... role=prefill ins=1 ep=10
-  active_requests=3 active_tokens=128.45 active_kv_cache=128.45 matched_tokens=64
-  prefill_endpoints=1:10=req:2,tokens:100.00,kv:100.00,match:64;1:11=req:1,tokens:40.00,kv:200.00,match:0
+  active_requests=3 active_tokens=128.45 active_kv_cache=128.45
+  prefill_endpoints=1:10=req:3,tokens:128.45,kv:128.45;1:11=req:1,tokens:40.00,kv:200.00
   decode_endpoints=2:20=req:5,tokens:200.00,kv:0.00 score=... fast_path=...
-
-Per-endpoint table semantics (parser-only; logs stay post-allocation):
-  - active_* / lb_score: reconstructed pre-allocate load (selected endpoint: req-1,
-    and tokens/kv cleared when that leaves req=0; other endpoints unchanged)
-  - selected_active_*: post-allocate load of the selected endpoint only (other rows are 0)
-  - score column removed
 
 Rows are sorted by processing order (log appearance order across input files).
 
@@ -47,18 +41,16 @@ _ALLOCATE_RE = re.compile(
     r"active_requests=(?P<active_requests>\S+)\s+"
     r"active_tokens=(?P<active_tokens>\S+)\s+"
     r"(?:active_kv_cache=(?P<active_kv_cache>\S+)\s+)?"
-    r"(?:matched_tokens=(?P<matched_tokens>\S+)\s+)?"
     r"prefill_endpoints=(?P<prefill_endpoints>\S+)\s+"
     r"decode_endpoints=(?P<decode_endpoints>\S+)\s+"
     r"score=(?P<score>\S+)\s+"
     r"fast_path=(?P<fast_path>\S+)"
 )
 
-# New: req:N,tokens:T,kv:K[,match:M]  |  Old (compat): req:N,tokens:T
+# New: req:N,tokens:T,kv:K  |  Old (compat): req:N,tokens:T
 _ENDPOINT_STAT_RE = re.compile(
     r"(?P<ins_ep>[^=;]+)=req:(?P<req>-?\d+),tokens:(?P<tokens>-?\d+(?:\.\d+)?)"
     r"(?:,kv:(?P<kv>-?\d+(?:\.\d+)?))?"
-    r"(?:,match:(?P<match>-?\d+))?"
 )
 
 _SUMMARY_COLUMNS = [
@@ -70,9 +62,9 @@ _SUMMARY_COLUMNS = [
     "active_requests",
     "active_tokens",
     "active_kv_cache",
-    "matched_tokens",
     "prefill_endpoints",
     "decode_endpoints",
+    "score",
     "fast_path",
 ]
 
@@ -88,11 +80,11 @@ _PER_ENDPOINT_COLUMNS = [
     "active_requests",
     "active_tokens",
     "active_kv_cache",
-    "matched_tokens",
     "lb_score",
     "selected_active_requests",
     "selected_active_tokens",
     "selected_active_kv_cache",
+    "score",
     "fast_path",
 ]
 
@@ -106,7 +98,6 @@ class EndpointStat:
     active_requests: int
     active_tokens: float
     active_kv_cache: float
-    matched_tokens: int | None
 
 
 def _prefill_lb_score(tokens: float, kv: float) -> float:
@@ -115,7 +106,7 @@ def _prefill_lb_score(tokens: float, kv: float) -> float:
 
 
 def parse_endpoint_stats(blob: str) -> list[EndpointStat]:
-    """Parse endpoint snapshot blob; kv/match are optional for older logs."""
+    """Parse endpoint snapshot blob; kv is optional for older logs."""
     if not blob or blob == "none":
         return []
     stats: list[EndpointStat] = []
@@ -125,7 +116,6 @@ def parse_endpoint_stats(blob: str) -> list[EndpointStat]:
             continue
         ins, ep = ins_ep.split(":", 1)
         kv_raw = match.group("kv")
-        match_raw = match.group("match")
         stats.append(
             EndpointStat(
                 ins=ins,
@@ -133,7 +123,6 @@ def parse_endpoint_stats(blob: str) -> list[EndpointStat]:
                 active_requests=int(match.group("req")),
                 active_tokens=float(match.group("tokens")),
                 active_kv_cache=float(kv_raw) if kv_raw is not None else 0.0,
-                matched_tokens=int(match_raw) if match_raw is not None else None,
             )
         )
     return stats
@@ -146,8 +135,6 @@ def parse_allocate_line(line: str) -> dict[str, str] | None:
     data = match.groupdict()
     if data.get("active_kv_cache") is None:
         data["active_kv_cache"] = ""
-    if data.get("matched_tokens") is None:
-        data["matched_tokens"] = ""
     return data
 
 
@@ -194,30 +181,12 @@ def build_per_endpoint_rows(
     records: list[dict[str, str]],
     pools: tuple[str, ...] = ("prefill", "decode"),
 ) -> list[dict[str, str]]:
-    """
-    Expand each ALLOCATE_ONLY record into per-endpoint rows.
-
-    Logs remain post-allocation. This parser reconstructs a decision-time view:
-      - active_* / lb_score: pre-allocation estimate from endpoint blobs
-        (on the selected endpoint, subtract the just-allocated request; if that
-        leaves req=0, also clear tokens/kv)
-      - selected_active_*: post-allocation values of the selected endpoint only;
-        other rows are 0
-      - score is omitted from the table
-    """
     rows: list[dict[str, str]] = []
     pool_blobs = {
         "prefill": "prefill_endpoints",
         "decode": "decode_endpoints",
     }
     for rec in records:
-        selected_ins = rec.get("ins", "")
-        selected_ep = rec.get("ep", "")
-        post_req = _parse_int(rec.get("active_requests", ""), default=0)
-        post_tokens = _parse_float(rec.get("active_tokens", ""), default=0.0)
-        post_kv = _parse_float(rec.get("active_kv_cache", ""), default=0.0)
-        post_match = rec.get("matched_tokens", "")
-
         for pool in pools:
             blob_key = pool_blobs.get(pool)
             if not blob_key:
@@ -230,81 +199,53 @@ def build_per_endpoint_rows(
                         "seq": rec.get("seq", ""),
                         "req_id": rec.get("req_id", ""),
                         "role": rec.get("role", ""),
-                        "selected_ins": selected_ins,
-                        "selected_ep": selected_ep,
+                        "selected_ins": "",
+                        "selected_ep": rec.get("ep", ""),
                         "pool": pool,
                         "ins": "",
                         "ep": "",
                         "active_requests": "",
                         "active_tokens": "",
                         "active_kv_cache": "",
-                        "matched_tokens": "",
                         "lb_score": "",
-                        "selected_active_requests": "0",
-                        "selected_active_tokens": "0.00",
-                        "selected_active_kv_cache": "0.00",
+                        "selected_active_requests": rec.get("active_requests", ""),
+                        "selected_active_tokens": rec.get("active_tokens", ""),
+                        "selected_active_kv_cache": rec.get("active_kv_cache", ""),
+                        "score": rec.get("score", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
                 continue
-
-            # Detect legacy post-alloc blobs: selected endpoint blob == top-level post values.
-            # New coordinator logs snapshot blobs before allocate, so this won't match.
-            legacy_post_alloc_blob = False
-            for stat in stats:
-                if str(stat.ins) == str(selected_ins) and str(stat.ep) == str(selected_ep):
-                    if (
-                        stat.active_requests == post_req
-                        and abs(stat.active_tokens - post_tokens) < 1e-6
-                        and abs(stat.active_kv_cache - post_kv) < 1e-6
-                    ):
-                        legacy_post_alloc_blob = True
-                    break
-
+            # Stable order within one allocate snapshot: ins/ep numeric when possible.
             def _sort_key(stat: EndpointStat) -> tuple:
                 try:
                     return (int(stat.ins), int(stat.ep))
                 except ValueError:
                     return (stat.ins, stat.ep)
 
+            selected_ins = rec.get("ins", "")
             for stat in sorted(stats, key=_sort_key):
-                is_selected = (
-                    str(stat.ins) == str(selected_ins) and str(stat.ep) == str(selected_ep)
-                )
-                req = stat.active_requests
-                tokens = stat.active_tokens
-                kv = stat.active_kv_cache
-                if is_selected and legacy_post_alloc_blob:
-                    # Recover approximate pre-allocation: allocate always +1 request.
-                    # If that was the only in-flight request, drop tokens/kv to 0 as well.
-                    req = max(0, req - 1)
-                    if req == 0:
-                        tokens = 0.0
-                        kv = 0.0
                 rows.append(
                     {
                         "seq": rec.get("seq", ""),
                         "req_id": rec.get("req_id", ""),
                         "role": rec.get("role", ""),
-                        "selected_ins": selected_ins,
-                        "selected_ep": selected_ep,
+                        # Only fill selected_ins on rows belonging to the chosen instance.
+                        "selected_ins": (
+                            selected_ins if str(stat.ins) == str(selected_ins) else ""
+                        ),
+                        "selected_ep": rec.get("ep", ""),
                         "pool": pool,
                         "ins": stat.ins,
                         "ep": stat.ep,
-                        "active_requests": str(req),
-                        "active_tokens": f"{tokens:.2f}",
-                        "active_kv_cache": f"{kv:.2f}",
-                        "matched_tokens": (
-                            "" if stat.matched_tokens is None else str(stat.matched_tokens)
-                        ),
-                        "lb_score": f"{_prefill_lb_score(tokens, kv):.2f}",
-                        "selected_active_requests": str(post_req) if is_selected else "0",
-                        "selected_active_tokens": (
-                            f"{post_tokens:.2f}" if is_selected else "0.00"
-                        ),
-                        "selected_active_kv_cache": (
-                            f"{post_kv:.2f}" if is_selected else "0.00"
-                        ),
+                        "active_requests": str(stat.active_requests),
+                        "active_tokens": f"{stat.active_tokens:.2f}",
+                        "active_kv_cache": f"{stat.active_kv_cache:.2f}",
+                        "lb_score": f"{_prefill_lb_score(stat.active_tokens, stat.active_kv_cache):.2f}",
+                        "selected_active_requests": rec.get("active_requests", ""),
+                        "selected_active_tokens": rec.get("active_tokens", ""),
+                        "selected_active_kv_cache": rec.get("active_kv_cache", ""),
+                        "score": rec.get("score", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
@@ -318,20 +259,6 @@ def build_per_endpoint_rows(
         )
     )
     return rows
-
-
-def _parse_int(value: str, default: int = 0) -> int:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def _parse_float(value: str, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _safe_int(value: str) -> tuple[int, str]:
