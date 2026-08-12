@@ -33,6 +33,10 @@ from motor.coordinator.scheduler.scheduler import Scheduler
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.runtime.workload_shm import WorkloadSharedMemoryWriter
 from motor.coordinator.scheduler.runtime.workload_shm.layout import DEFAULT_WORKLOAD_SHM_MAX_ENTRIES
+from motor.coordinator.scheduler.runtime.endpoint_queue_stats import (
+    EndpointQueueStatsCache,
+    format_role_queue_stats,
+)
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     SchedulerRequest, SchedulerResponse, SchedulerRequestType, SchedulerResponseType,
     CANDIDATE_POLICY_LOAD_BALANCE,
@@ -90,6 +94,8 @@ _KEY_CANDIDATES = "candidates"
 _KEY_ACTIVE_REQUESTS = "active_requests"
 _KEY_PREFILL_ENDPOINTS = "prefill_endpoints"
 _KEY_DECODE_ENDPOINTS = "decode_endpoints"
+_KEY_PREFILL_DPS = "prefill_dps"
+_KEY_DECODE_DPS = "decode_dps"
 
 
 def _should_log_scheduling_sample(sample_key: str) -> bool:
@@ -102,6 +108,14 @@ def _format_endpoint_active_requests(endpoint_counts: dict[str, int]) -> str:
     if not endpoint_counts:
         return "none"
     return ",".join(f"{key}={count}" for key, count in endpoint_counts.items())
+
+
+def _queue_stats_to_dict(stats: dict) -> dict[str, dict[str, int]]:
+    """Convert EndpointQueueStats map to JSON-friendly dict."""
+    return {
+        key: {"running": value.running, "waiting": value.waiting}
+        for key, value in stats.items()
+    }
 
 
 # ==================== Serialization (module-level, shared by Server / Broadcaster) ====================
@@ -169,12 +183,14 @@ class _SchedulerRequestDispatcher:
         config: CoordinatorConfig,
         workload_writer: WorkloadSharedMemoryWriter | None = None,
         on_instance_refresh_done: Callable[[], None | Awaitable[None]] | None = None,
+        queue_stats_cache: EndpointQueueStatsCache | None = None,
     ):
         self._instance_manager = instance_manager
         self._scheduler = scheduler
         self._config = config
         self._workload_writer = workload_writer
         self._on_instance_refresh_done = on_instance_refresh_done
+        self._queue_stats_cache = queue_stats_cache or EndpointQueueStatsCache()
         self._workload_commit_lock = asyncio.Lock()
         self._endpoint_instance_score_weight = max(
             0.0,
@@ -408,13 +424,23 @@ class _SchedulerRequestDispatcher:
         ep_active_requests = int(endpoint.workload.active_requests)
         prefill_endpoints = self._role_endpoint_active_requests(PDRole.ROLE_P)
         decode_endpoints = self._role_endpoint_active_requests(PDRole.ROLE_D)
+        prefill_dps = self._queue_stats_cache.role_stats(
+            self._instance_manager, PDRole.ROLE_P
+        )
+        decode_dps = self._queue_stats_cache.role_stats(
+            self._instance_manager, PDRole.ROLE_D
+        )
         if _should_log_scheduling_sample(req_id or request.request_id):
             logger.info(
-                "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "
-                "active_requests=%d prefill_endpoints=%s decode_endpoints=%s "
+                "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s dp=%s "
+                "active_requests=%d "
+                "prefill_dps=%s decode_dps=%s "
+                "prefill_endpoints=%s decode_endpoints=%s "
                 "score=%.4f fast_path=%s",
-                req_id, role.value, instance.id, endpoint.id,
+                req_id, role.value, instance.id, endpoint.id, endpoint.id,
                 ep_active_requests,
+                format_role_queue_stats(prefill_dps),
+                format_role_queue_stats(decode_dps),
                 _format_endpoint_active_requests(prefill_endpoints),
                 _format_endpoint_active_requests(decode_endpoints),
                 selected_score, fast_path,
@@ -430,6 +456,8 @@ class _SchedulerRequestDispatcher:
                 _KEY_ACTIVE_REQUESTS: ep_active_requests,
                 _KEY_PREFILL_ENDPOINTS: prefill_endpoints,
                 _KEY_DECODE_ENDPOINTS: decode_endpoints,
+                _KEY_PREFILL_DPS: _queue_stats_to_dict(prefill_dps),
+                _KEY_DECODE_DPS: _queue_stats_to_dict(decode_dps),
             },
         )
 
@@ -748,6 +776,8 @@ class AsyncSchedulerServer:
         self._workload_shm = None
         self._workload_writer: WorkloadSharedMemoryWriter | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._queue_stats_task: asyncio.Task | None = None
+        self._queue_stats_cache = EndpointQueueStatsCache()
         self._pub_socket: zmq.asyncio.Socket | None = None
 
     async def stop(self):
@@ -756,13 +786,15 @@ class AsyncSchedulerServer:
 
         self._stop_event.set()
 
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
+        for task_attr in ("_heartbeat_task", "_queue_stats_task"):
+            task = getattr(self, task_attr, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, task_attr, None)
 
         # Wait for all active request-handling tasks to finish
         if self._active_tasks:
@@ -835,6 +867,7 @@ class AsyncSchedulerServer:
         logger.info("Workload shared memory enabled: %s (%d entries)", shm_name, max_entries)
 
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._queue_stats_task = asyncio.create_task(self._queue_stats_loop())
 
         self._dispatcher = _SchedulerRequestDispatcher(
             self.instance_manager,
@@ -842,6 +875,7 @@ class AsyncSchedulerServer:
             self.config,
             workload_writer=self._workload_writer,
             on_instance_refresh_done=self._publish_instance_changed,
+            queue_stats_cache=self._queue_stats_cache,
         )
 
         logger.info("Async scheduler server started, frontend: %s", self.frontend_address)
@@ -876,6 +910,26 @@ class AsyncSchedulerServer:
                 break
             except Exception as e:
                 logger.debug("Workload heartbeat error: %s", e)
+
+    async def _queue_stats_loop(self) -> None:
+        """Periodically scrape engine running/waiting gauges for allocate-time DP logs."""
+        while not self._stop_event.is_set():
+            try:
+                reuse_time = getattr(
+                    self.config.prometheus_metrics_config, "reuse_time", 3
+                )
+                interval = max(1.0, float(reuse_time))
+                ok = await self._queue_stats_cache.refresh(self.instance_manager)
+                logger.debug(
+                    "Refreshed endpoint queue stats endpoints_ok=%d interval=%.1fs",
+                    ok, interval,
+                )
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Endpoint queue stats refresh failed: %s", e)
+                await asyncio.sleep(3.0)
 
     async def _run_async_loop(self):
         """Async main loop: handle all requests concurrently; main loop never blocks."""

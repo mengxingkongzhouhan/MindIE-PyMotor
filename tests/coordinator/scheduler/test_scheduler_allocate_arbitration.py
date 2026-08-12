@@ -513,6 +513,9 @@ async def test_allocate_only_tracks_and_returns_active_requests():
     assert response.data["active_requests"] == 1
     assert response.data["prefill_endpoints"] == {"1:10": 1, "1:11": 0}
     assert response.data["decode_endpoints"] == {"2:20": 2, "2:21": 1}
+    # Without a populated queue-stats cache, missing scrape shows as -1.
+    assert response.data["prefill_dps"]["1:10"] == {"running": -1, "waiting": -1}
+    assert response.data["decode_dps"]["2:20"] == {"running": -1, "waiting": -1}
     assert response.data["endpoint"]["workload"]["active_requests"] == 1
     _, selected_workload = await instance_manager.get_endpoint_workload(1, 10)
     assert selected_workload.active_requests == 1
