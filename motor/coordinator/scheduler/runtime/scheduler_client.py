@@ -772,11 +772,11 @@ class AsyncSchedulerClient:
             if out_endpoint:
                 logger.debug(
                     "select_and_allocate success role=%s instance_id=%s endpoint_id=%s "
-                    "active_requests=%s prefill_dps=%s decode_dps=%s",
+                    "active_requests=%s prefill_endpoints=%s decode_endpoints=%s",
                     role_str, out_instance.id, out_endpoint.id,
                     data.get("active_requests"),
-                    data.get("prefill_dps"),
-                    data.get("decode_dps"),
+                    data.get("prefill_endpoints"),
+                    data.get("decode_endpoints"),
                 )
                 return (out_instance, out_endpoint, workload)
 
