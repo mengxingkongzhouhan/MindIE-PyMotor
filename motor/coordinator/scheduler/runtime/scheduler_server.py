@@ -395,6 +395,16 @@ class _SchedulerRequestDispatcher:
                     data={_KEY_INSTANCE: None, _KEY_ENDPOINT: None},
                 )
             instance, endpoint, selected_score = selected
+            endpoint_matches = self._extract_endpoint_matches(request.data)
+            # Snapshot BEFORE allocation so logs/tables reflect the decision-time load.
+            prefill_endpoints = self._role_endpoint_workload(
+                PDRole.ROLE_P, endpoint_matches=endpoint_matches or None
+            )
+            decode_endpoints = self._role_endpoint_workload(PDRole.ROLE_D)
+            selected_match_key = f"{instance.id}:{endpoint.id}"
+            ep_matched_tokens = (
+                int(endpoint_matches.get(selected_match_key, 0)) if endpoint_matches else None
+            )
             params = UpdateWorkloadParams(
                 instance_id=instance.id,
                 endpoint_id=endpoint.id,
@@ -415,19 +425,12 @@ class _SchedulerRequestDispatcher:
             )
         instance_data = _serialize_instance_minimal(instance) if instance else None
         endpoint_data = _serialize_endpoint_minimal(endpoint) if endpoint else None
+        # Top-level active_* are post-allocation values of the selected endpoint.
         ep_active_requests = int(endpoint.workload.active_requests)
         ep_active_tokens = float(endpoint.workload.active_tokens)
         ep_active_kv_cache = float(endpoint.workload.active_kv_cache)
-        endpoint_matches = self._extract_endpoint_matches(request.data)
-        selected_match_key = f"{instance.id}:{endpoint.id}"
-        ep_matched_tokens = (
-            int(endpoint_matches.get(selected_match_key, 0)) if endpoint_matches else None
-        )
-        prefill_endpoints = self._role_endpoint_workload(
-            PDRole.ROLE_P, endpoint_matches=endpoint_matches or None
-        )
-        decode_endpoints = self._role_endpoint_workload(PDRole.ROLE_D)
         # Always log every allocate (needed for per-request endpoint workload tables).
+        # prefill/decode endpoint blobs are pre-allocation; selected active_* are post-allocation.
         if ep_matched_tokens is None:
             logger.info(
                 "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "

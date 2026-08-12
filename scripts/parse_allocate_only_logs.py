@@ -7,8 +7,12 @@ Filter ALLOCATE_ONLY scheduling logs into a table.
 Parses lines like:
   ALLOCATE_ONLY req_id=... role=prefill ins=1 ep=10
   active_requests=3 active_tokens=128.45 active_kv_cache=128.45 matched_tokens=64
-  prefill_endpoints=1:10=req:3,tokens:128.45,kv:128.45,match:64;1:11=req:1,tokens:40.00,kv:200.00,match:0
+  prefill_endpoints=1:10=req:2,tokens:100.00,kv:100.00,match:64;1:11=req:1,tokens:40.00,kv:200.00,match:0
   decode_endpoints=2:20=req:5,tokens:200.00,kv:0.00 score=... fast_path=...
+
+Per-endpoint table semantics:
+  - active_* / lb_score: load before this allocate (decision-time)
+  - selected_active_*: post-allocate load of the selected endpoint only (other rows are 0)
 
 Rows are sorted by processing order (log appearance order across input files).
 
@@ -67,7 +71,6 @@ _SUMMARY_COLUMNS = [
     "matched_tokens",
     "prefill_endpoints",
     "decode_endpoints",
-    "score",
     "fast_path",
 ]
 
@@ -89,7 +92,6 @@ _PER_ENDPOINT_COLUMNS = [
     "selected_active_tokens",
     "selected_active_kv_cache",
     "selected_matched_tokens",
-    "score",
     "fast_path",
 ]
 
@@ -191,12 +193,29 @@ def build_per_endpoint_rows(
     records: list[dict[str, str]],
     pools: tuple[str, ...] = ("prefill", "decode"),
 ) -> list[dict[str, str]]:
+    """
+    Expand each ALLOCATE_ONLY record into per-endpoint rows.
+
+    Semantics (with updated coordinator logs):
+      - active_* / lb_score: pre-allocation snapshot from endpoint blobs
+      - selected_active_*: post-allocation values of the selected endpoint, only on that
+        endpoint's row; other rows are 0
+    For older post-allocation blobs, reconstruct pre-allocation on the selected endpoint by
+    subtracting the observed post-allocation delta (top-level selected - blob selected).
+    """
     rows: list[dict[str, str]] = []
     pool_blobs = {
         "prefill": "prefill_endpoints",
         "decode": "decode_endpoints",
     }
     for rec in records:
+        selected_ins = rec.get("ins", "")
+        selected_ep = rec.get("ep", "")
+        post_req = _parse_int(rec.get("active_requests", ""), default=0)
+        post_tokens = _parse_float(rec.get("active_tokens", ""), default=0.0)
+        post_kv = _parse_float(rec.get("active_kv_cache", ""), default=0.0)
+        post_match = rec.get("matched_tokens", "")
+
         for pool in pools:
             blob_key = pool_blobs.get(pool)
             if not blob_key:
@@ -209,8 +228,8 @@ def build_per_endpoint_rows(
                         "seq": rec.get("seq", ""),
                         "req_id": rec.get("req_id", ""),
                         "role": rec.get("role", ""),
-                        "selected_ins": rec.get("ins", ""),
-                        "selected_ep": rec.get("ep", ""),
+                        "selected_ins": selected_ins,
+                        "selected_ep": selected_ep,
                         "pool": pool,
                         "ins": "",
                         "ep": "",
@@ -219,16 +238,28 @@ def build_per_endpoint_rows(
                         "active_kv_cache": "",
                         "matched_tokens": "",
                         "lb_score": "",
-                        "selected_active_requests": rec.get("active_requests", ""),
-                        "selected_active_tokens": rec.get("active_tokens", ""),
-                        "selected_active_kv_cache": rec.get("active_kv_cache", ""),
-                        "selected_matched_tokens": rec.get("matched_tokens", ""),
-                        "score": rec.get("score", ""),
+                        "selected_active_requests": "0",
+                        "selected_active_tokens": "0.00",
+                        "selected_active_kv_cache": "0.00",
+                        "selected_matched_tokens": "0" if post_match != "" else "",
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
                 continue
-            # Stable order within one allocate snapshot: ins/ep numeric when possible.
+
+            # Detect legacy post-alloc blobs: selected endpoint blob == top-level post values.
+            # New coordinator logs snapshot blobs before allocate, so this won't match.
+            legacy_post_alloc_blob = False
+            for stat in stats:
+                if str(stat.ins) == str(selected_ins) and str(stat.ep) == str(selected_ep):
+                    if (
+                        stat.active_requests == post_req
+                        and abs(stat.active_tokens - post_tokens) < 1e-6
+                        and abs(stat.active_kv_cache - post_kv) < 1e-6
+                    ):
+                        legacy_post_alloc_blob = True
+                    break
+
             def _sort_key(stat: EndpointStat) -> tuple:
                 try:
                     return (int(stat.ins), int(stat.ep))
@@ -236,28 +267,48 @@ def build_per_endpoint_rows(
                     return (stat.ins, stat.ep)
 
             for stat in sorted(stats, key=_sort_key):
+                is_selected = (
+                    str(stat.ins) == str(selected_ins) and str(stat.ep) == str(selected_ep)
+                )
+                req = stat.active_requests
+                tokens = stat.active_tokens
+                kv = stat.active_kv_cache
+                if is_selected and legacy_post_alloc_blob:
+                    # Recover approximate pre-allocation: allocate always +1 request.
+                    # If that was the only in-flight request, drop tokens/kv to 0 as well.
+                    req = max(0, req - 1)
+                    if req == 0:
+                        tokens = 0.0
+                        kv = 0.0
                 rows.append(
                     {
                         "seq": rec.get("seq", ""),
                         "req_id": rec.get("req_id", ""),
                         "role": rec.get("role", ""),
-                        "selected_ins": rec.get("ins", ""),
-                        "selected_ep": rec.get("ep", ""),
+                        "selected_ins": selected_ins,
+                        "selected_ep": selected_ep,
                         "pool": pool,
                         "ins": stat.ins,
                         "ep": stat.ep,
-                        "active_requests": str(stat.active_requests),
-                        "active_tokens": f"{stat.active_tokens:.2f}",
-                        "active_kv_cache": f"{stat.active_kv_cache:.2f}",
+                        "active_requests": str(req),
+                        "active_tokens": f"{tokens:.2f}",
+                        "active_kv_cache": f"{kv:.2f}",
                         "matched_tokens": (
                             "" if stat.matched_tokens is None else str(stat.matched_tokens)
                         ),
-                        "lb_score": f"{_prefill_lb_score(stat.active_tokens, stat.active_kv_cache):.2f}",
-                        "selected_active_requests": rec.get("active_requests", ""),
-                        "selected_active_tokens": rec.get("active_tokens", ""),
-                        "selected_active_kv_cache": rec.get("active_kv_cache", ""),
-                        "selected_matched_tokens": rec.get("matched_tokens", ""),
-                        "score": rec.get("score", ""),
+                        "lb_score": f"{_prefill_lb_score(tokens, kv):.2f}",
+                        "selected_active_requests": str(post_req) if is_selected else "0",
+                        "selected_active_tokens": (
+                            f"{post_tokens:.2f}" if is_selected else "0.00"
+                        ),
+                        "selected_active_kv_cache": (
+                            f"{post_kv:.2f}" if is_selected else "0.00"
+                        ),
+                        "selected_matched_tokens": (
+                            (post_match if post_match != "" else "0") if is_selected else (
+                                "0" if post_match != "" else ""
+                            )
+                        ),
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
@@ -271,6 +322,20 @@ def build_per_endpoint_rows(
         )
     )
     return rows
+
+
+def _parse_int(value: str, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_float(value: str, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _safe_int(value: str) -> tuple[int, str]:

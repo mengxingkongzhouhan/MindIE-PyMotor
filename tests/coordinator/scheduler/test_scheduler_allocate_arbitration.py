@@ -512,8 +512,9 @@ async def test_allocate_only_tracks_and_returns_active_requests():
     assert response.data["endpoint"]["id"] == 10
     assert response.data["active_requests"] == 1
     assert response.data["active_tokens"] == 3.0
+    # Endpoint blobs are snapshotted before allocation (decision-time load).
     assert response.data["prefill_endpoints"] == {
-        "1:10": {"active_requests": 1, "active_tokens": 3.0, "active_kv_cache": 0.0},
+        "1:10": {"active_requests": 0, "active_tokens": 0.0, "active_kv_cache": 0.0},
         "1:11": {"active_requests": 0, "active_tokens": 0.0, "active_kv_cache": 0.0},
     }
     assert response.data["decode_endpoints"] == {
