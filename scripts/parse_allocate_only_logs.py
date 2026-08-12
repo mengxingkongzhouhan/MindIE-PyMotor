@@ -6,8 +6,8 @@ Filter ALLOCATE_ONLY scheduling logs into a table.
 
 Parses lines like:
   ALLOCATE_ONLY req_id=... role=prefill ins=1 ep=10
-  active_requests=3 active_tokens=128.45 active_kv_cache=128.45
-  prefill_endpoints=1:10=req:3,tokens:128.45,kv:128.45;1:11=req:1,tokens:40.00,kv:200.00
+  active_requests=3 active_tokens=128.45 active_kv_cache=128.45 matched_tokens=64
+  prefill_endpoints=1:10=req:3,tokens:128.45,kv:128.45,match:64;1:11=req:1,tokens:40.00,kv:200.00,match:0
   decode_endpoints=2:20=req:5,tokens:200.00,kv:0.00 score=... fast_path=...
 
 Rows are sorted by processing order (log appearance order across input files).
@@ -41,16 +41,18 @@ _ALLOCATE_RE = re.compile(
     r"active_requests=(?P<active_requests>\S+)\s+"
     r"active_tokens=(?P<active_tokens>\S+)\s+"
     r"(?:active_kv_cache=(?P<active_kv_cache>\S+)\s+)?"
+    r"(?:matched_tokens=(?P<matched_tokens>\S+)\s+)?"
     r"prefill_endpoints=(?P<prefill_endpoints>\S+)\s+"
     r"decode_endpoints=(?P<decode_endpoints>\S+)\s+"
     r"score=(?P<score>\S+)\s+"
     r"fast_path=(?P<fast_path>\S+)"
 )
 
-# New: req:N,tokens:T,kv:K  |  Old (compat): req:N,tokens:T
+# New: req:N,tokens:T,kv:K[,match:M]  |  Old (compat): req:N,tokens:T
 _ENDPOINT_STAT_RE = re.compile(
     r"(?P<ins_ep>[^=;]+)=req:(?P<req>-?\d+),tokens:(?P<tokens>-?\d+(?:\.\d+)?)"
     r"(?:,kv:(?P<kv>-?\d+(?:\.\d+)?))?"
+    r"(?:,match:(?P<match>-?\d+))?"
 )
 
 _SUMMARY_COLUMNS = [
@@ -62,6 +64,7 @@ _SUMMARY_COLUMNS = [
     "active_requests",
     "active_tokens",
     "active_kv_cache",
+    "matched_tokens",
     "prefill_endpoints",
     "decode_endpoints",
     "score",
@@ -80,10 +83,12 @@ _PER_ENDPOINT_COLUMNS = [
     "active_requests",
     "active_tokens",
     "active_kv_cache",
+    "matched_tokens",
     "lb_score",
     "selected_active_requests",
     "selected_active_tokens",
     "selected_active_kv_cache",
+    "selected_matched_tokens",
     "score",
     "fast_path",
 ]
@@ -98,6 +103,7 @@ class EndpointStat:
     active_requests: int
     active_tokens: float
     active_kv_cache: float
+    matched_tokens: int | None
 
 
 def _prefill_lb_score(tokens: float, kv: float) -> float:
@@ -106,7 +112,7 @@ def _prefill_lb_score(tokens: float, kv: float) -> float:
 
 
 def parse_endpoint_stats(blob: str) -> list[EndpointStat]:
-    """Parse endpoint snapshot blob; kv is optional for older logs."""
+    """Parse endpoint snapshot blob; kv/match are optional for older logs."""
     if not blob or blob == "none":
         return []
     stats: list[EndpointStat] = []
@@ -116,6 +122,7 @@ def parse_endpoint_stats(blob: str) -> list[EndpointStat]:
             continue
         ins, ep = ins_ep.split(":", 1)
         kv_raw = match.group("kv")
+        match_raw = match.group("match")
         stats.append(
             EndpointStat(
                 ins=ins,
@@ -123,6 +130,7 @@ def parse_endpoint_stats(blob: str) -> list[EndpointStat]:
                 active_requests=int(match.group("req")),
                 active_tokens=float(match.group("tokens")),
                 active_kv_cache=float(kv_raw) if kv_raw is not None else 0.0,
+                matched_tokens=int(match_raw) if match_raw is not None else None,
             )
         )
     return stats
@@ -135,6 +143,8 @@ def parse_allocate_line(line: str) -> dict[str, str] | None:
     data = match.groupdict()
     if data.get("active_kv_cache") is None:
         data["active_kv_cache"] = ""
+    if data.get("matched_tokens") is None:
+        data["matched_tokens"] = ""
     return data
 
 
@@ -207,10 +217,12 @@ def build_per_endpoint_rows(
                         "active_requests": "",
                         "active_tokens": "",
                         "active_kv_cache": "",
+                        "matched_tokens": "",
                         "lb_score": "",
                         "selected_active_requests": rec.get("active_requests", ""),
                         "selected_active_tokens": rec.get("active_tokens", ""),
                         "selected_active_kv_cache": rec.get("active_kv_cache", ""),
+                        "selected_matched_tokens": rec.get("matched_tokens", ""),
                         "score": rec.get("score", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }
@@ -237,10 +249,14 @@ def build_per_endpoint_rows(
                         "active_requests": str(stat.active_requests),
                         "active_tokens": f"{stat.active_tokens:.2f}",
                         "active_kv_cache": f"{stat.active_kv_cache:.2f}",
+                        "matched_tokens": (
+                            "" if stat.matched_tokens is None else str(stat.matched_tokens)
+                        ),
                         "lb_score": f"{_prefill_lb_score(stat.active_tokens, stat.active_kv_cache):.2f}",
                         "selected_active_requests": rec.get("active_requests", ""),
                         "selected_active_tokens": rec.get("active_tokens", ""),
                         "selected_active_kv_cache": rec.get("active_kv_cache", ""),
+                        "selected_matched_tokens": rec.get("matched_tokens", ""),
                         "score": rec.get("score", ""),
                         "fast_path": rec.get("fast_path", ""),
                     }

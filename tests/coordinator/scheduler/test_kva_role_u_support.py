@@ -65,13 +65,13 @@ def test_kv_cache_affinity_uses_kva_for_role_u() -> None:
 
     with patch(
         "motor.coordinator.scheduler.runtime.scheduler_client."
-        "KvCacheAffinityPolicy.select_endpoint_candidates_from_list",
-        return_value=ranked,
+        "KvCacheAffinityPolicy.select_endpoint_candidates_with_matches_from_list",
+        return_value=(ranked, {"1:0": 0}),
     ) as mock_kva, patch.object(
         client,
         "_select_endpoint_candidates_by_load_balance",
     ) as mock_load_balance:
-        candidates, candidate_policy = client._select_endpoint_candidates_from_list_with_policy(
+        candidates, candidate_policy, _matches = client._select_endpoint_candidates_from_list_with_policy(
             [instance], PDRole.ROLE_U, req_info, top_k=1
         )
 
@@ -91,14 +91,14 @@ def test_kv_cache_affinity_falls_back_to_load_balance_for_role_u() -> None:
 
     with patch(
         "motor.coordinator.scheduler.runtime.scheduler_client."
-        "KvCacheAffinityPolicy.select_endpoint_candidates_from_list",
-        return_value=[],
+        "KvCacheAffinityPolicy.select_endpoint_candidates_with_matches_from_list",
+        return_value=None,
     ) as mock_kva, patch.object(
         client,
         "_select_endpoint_candidates_by_load_balance",
         return_value=lb_candidates,
     ) as mock_load_balance:
-        candidates, candidate_policy = client._select_endpoint_candidates_from_list_with_policy(
+        candidates, candidate_policy, _matches = client._select_endpoint_candidates_from_list_with_policy(
             [instance], PDRole.ROLE_U, req_info, top_k=1
         )
 
@@ -118,13 +118,13 @@ def test_kv_cache_affinity_skips_kva_for_non_kva_roles() -> None:
 
     with patch(
         "motor.coordinator.scheduler.runtime.scheduler_client."
-        "KvCacheAffinityPolicy.select_endpoint_candidates_from_list"
+        "KvCacheAffinityPolicy.select_endpoint_candidates_with_matches_from_list"
     ) as mock_kva, patch.object(
         client,
         "_select_endpoint_candidates_by_load_balance",
         return_value=lb_candidates,
     ) as mock_load_balance:
-        candidates, candidate_policy = client._select_endpoint_candidates_from_list_with_policy(
+        candidates, candidate_policy, _matches = client._select_endpoint_candidates_from_list_with_policy(
             [instance], PDRole.ROLE_D, req_info, top_k=1
         )
 
