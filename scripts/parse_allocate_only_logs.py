@@ -219,7 +219,11 @@ def build_per_endpoint_rows(
                     return (stat.ins, stat.ep)
 
             selected_ins = rec.get("ins", "")
+            selected_ep = rec.get("ep", "")
             for stat in sorted(stats, key=_sort_key):
+                is_selected = (
+                    str(stat.ins) == str(selected_ins) and str(stat.ep) == str(selected_ep)
+                )
                 rows.append(
                     {
                         "seq": rec.get("seq", ""),
@@ -229,7 +233,7 @@ def build_per_endpoint_rows(
                         "selected_ins": (
                             selected_ins if str(stat.ins) == str(selected_ins) else ""
                         ),
-                        "selected_ep": rec.get("ep", ""),
+                        "selected_ep": selected_ep,
                         "pool": pool,
                         "ins": stat.ins,
                         "ep": stat.ep,
@@ -237,8 +241,13 @@ def build_per_endpoint_rows(
                         "active_tokens": f"{stat.active_tokens:.2f}",
                         "active_kv_cache": f"{stat.active_kv_cache:.2f}",
                         "lb_score": f"{_prefill_lb_score(stat.active_tokens, stat.active_kv_cache):.2f}",
-                        "selected_active_requests": rec.get("active_requests", ""),
-                        "selected_active_tokens": rec.get("active_tokens", ""),
+                        # Only fill selected_active_* on the chosen endpoint row.
+                        "selected_active_requests": (
+                            rec.get("active_requests", "") if is_selected else ""
+                        ),
+                        "selected_active_tokens": (
+                            rec.get("active_tokens", "") if is_selected else ""
+                        ),
                         "fast_path": rec.get("fast_path", ""),
                     }
                 )
