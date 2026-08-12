@@ -54,7 +54,7 @@ def _collect_entries_and_slot_map(instance_manager: InstanceManager, max_entries
     Collect (instance_id, endpoint_id, role, workload) from all pools and build slot_map.
     Returns (entries list, slot_map dict).
     """
-    entries: list[tuple[int, int, int, float, float]] = []
+    entries: list[tuple[int, int, int, float, float, int]] = []
     slot_map: dict[tuple[int, int], int] = {}
 
     for role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):
@@ -78,6 +78,7 @@ def _collect_entries_and_slot_map(instance_manager: InstanceManager, max_entries
                             shm_role,
                             ep.workload.active_tokens,
                             ep.workload.active_kv_cache,
+                            int(ep.workload.active_requests),
                         )
                     )
     return entries, slot_map
@@ -139,7 +140,7 @@ class WorkloadSharedMemoryWriter:
         )
         self._entry_count = len(entries)
         self._begin_write()
-        for slot, (iid, eid, role, tokens, kv) in enumerate(entries):
+        for slot, (iid, eid, role, tokens, kv, reqs) in enumerate(entries):
             self._write_entry_at_slot(
                 slot,
                 WorkloadShmEntry(
@@ -148,6 +149,7 @@ class WorkloadSharedMemoryWriter:
                     role=role,
                     active_tokens=tokens,
                     active_kv_cache=kv,
+                    active_requests=reqs,
                 ),
             )
         self._instance_version += 1
@@ -172,6 +174,7 @@ class WorkloadSharedMemoryWriter:
                 role=shm_role,
                 active_tokens=workload.active_tokens,
                 active_kv_cache=workload.active_kv_cache,
+                active_requests=int(workload.active_requests),
             ),
         )
         self._end_write()

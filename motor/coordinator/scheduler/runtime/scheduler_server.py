@@ -72,9 +72,6 @@ def _create_workload_shared_memory(shared_memory_mod, shm_name: str, shm_size: i
         return shared_memory_mod.SharedMemory(name=shm_name, create=True, size=shm_size)
 
 
-# Hot-path scheduling log sampling: ~1% of requests to reduce I/O and CPU at high QPS
-_SCHEDULING_LOG_SAMPLE_RATE = 100
-
 # Display string for unknown/hybrid role in logs
 _ROLE_DISPLAY_HYBRID = "hybrid"
 
@@ -87,11 +84,31 @@ _KEY_INSTANCE_VERSION = "instance_version"
 _KEY_FAST_PATH = "fast_path"
 _KEY_CANDIDATE_POLICY = "candidate_policy"
 _KEY_CANDIDATES = "candidates"
+_KEY_ACTIVE_REQUESTS = "active_requests"
+_KEY_ACTIVE_TOKENS = "active_tokens"
+_KEY_ACTIVE_KV_CACHE = "active_kv_cache"
+_KEY_MATCHED_TOKENS = "matched_tokens"
+_KEY_PREFILL_ENDPOINTS = "prefill_endpoints"
+_KEY_DECODE_ENDPOINTS = "decode_endpoints"
+_KEY_ENDPOINT_MATCHES = "endpoint_matches"
 
 
-def _should_log_scheduling_sample(sample_key: str) -> bool:
-    """Return True for ~1/_SCHEDULING_LOG_SAMPLE_RATE of requests (hot-path info sampling)."""
-    return bool(sample_key) and hash(sample_key) % _SCHEDULING_LOG_SAMPLE_RATE == 0
+def _format_endpoint_workload(endpoint_stats: dict[str, dict[str, float | int]]) -> str:
+    """Format per-endpoint workload for logs: ins:ep=req:N,tokens:T,kv:K[,match:M];..."""
+    if not endpoint_stats:
+        return "none"
+    parts = []
+    for key, stats in endpoint_stats.items():
+        part = (
+            f"{key}=req:{int(stats.get('active_requests', 0))},"
+            f"tokens:{float(stats.get('active_tokens', 0.0)):.2f},"
+            f"kv:{float(stats.get('active_kv_cache', 0.0)):.2f}"
+        )
+        if "matched_tokens" in stats:
+            part += f",match:{int(stats.get('matched_tokens', 0))}"
+        parts.append(part)
+    return ";".join(parts)
+
 
 # ==================== Serialization (module-level, shared by Server / Broadcaster) ====================
 
@@ -133,6 +150,14 @@ def _serialize_endpoint_minimal(endpoint: Endpoint | None) -> dict:
         "ip": endpoint.ip,
         "business_port": endpoint.business_port,
         "mgmt_port": getattr(endpoint, "mgmt_port", "") or "",
+        # Carry workload snapshot so Workers can log it after ALLOCATE_ONLY.
+        "workload": {
+            "active_requests": int(getattr(endpoint.workload, "active_requests", 0) or 0),
+            "active_tokens": float(getattr(endpoint.workload, "active_tokens", 0.0) or 0.0),
+            "active_kv_cache": float(
+                getattr(endpoint.workload, "active_kv_cache", 0.0) or 0.0
+            ),
+        },
     }
     if hasattr(endpoint, "status") and endpoint.status is not None:
         out["status"] = endpoint.status.value if hasattr(endpoint.status, "value") else str(endpoint.status)
@@ -390,20 +415,64 @@ class _SchedulerRequestDispatcher:
             )
         instance_data = _serialize_instance_minimal(instance) if instance else None
         endpoint_data = _serialize_endpoint_minimal(endpoint) if endpoint else None
-        if _should_log_scheduling_sample(req_id or request.request_id):
+        ep_active_requests = int(endpoint.workload.active_requests)
+        ep_active_tokens = float(endpoint.workload.active_tokens)
+        ep_active_kv_cache = float(endpoint.workload.active_kv_cache)
+        endpoint_matches = self._extract_endpoint_matches(request.data)
+        selected_match_key = f"{instance.id}:{endpoint.id}"
+        ep_matched_tokens = (
+            int(endpoint_matches.get(selected_match_key, 0)) if endpoint_matches else None
+        )
+        prefill_endpoints = self._role_endpoint_workload(
+            PDRole.ROLE_P, endpoint_matches=endpoint_matches or None
+        )
+        decode_endpoints = self._role_endpoint_workload(PDRole.ROLE_D)
+        # Always log every allocate (needed for per-request endpoint workload tables).
+        if ep_matched_tokens is None:
             logger.info(
-                "ALLOCATE_ONLY req_id=%s ins=%s ep=%s score=%.4f fast_path=%s",
-                req_id, instance.id, endpoint.id, selected_score, fast_path,
+                "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "
+                "active_requests=%d active_tokens=%.2f active_kv_cache=%.2f "
+                "prefill_endpoints=%s decode_endpoints=%s "
+                "score=%.4f fast_path=%s",
+                req_id, role.value, instance.id, endpoint.id,
+                ep_active_requests, ep_active_tokens, ep_active_kv_cache,
+                _format_endpoint_workload(prefill_endpoints),
+                _format_endpoint_workload(decode_endpoints),
+                selected_score, fast_path,
             )
+        else:
+            logger.info(
+                "ALLOCATE_ONLY req_id=%s role=%s ins=%s ep=%s "
+                "active_requests=%d active_tokens=%.2f active_kv_cache=%.2f "
+                "matched_tokens=%d "
+                "prefill_endpoints=%s decode_endpoints=%s "
+                "score=%.4f fast_path=%s",
+                req_id, role.value, instance.id, endpoint.id,
+                ep_active_requests, ep_active_tokens, ep_active_kv_cache,
+                int(ep_matched_tokens),
+                _format_endpoint_workload(prefill_endpoints),
+                _format_endpoint_workload(decode_endpoints),
+                selected_score, fast_path,
+            )
+        response_data = {
+            _KEY_INSTANCE: instance_data,
+            _KEY_ENDPOINT: endpoint_data,
+            _KEY_SELECTED_SCORE: selected_score,
+            _KEY_FAST_PATH: fast_path,
+            _KEY_ACTIVE_REQUESTS: ep_active_requests,
+            _KEY_ACTIVE_TOKENS: ep_active_tokens,
+            _KEY_ACTIVE_KV_CACHE: ep_active_kv_cache,
+            _KEY_PREFILL_ENDPOINTS: prefill_endpoints,
+            _KEY_DECODE_ENDPOINTS: decode_endpoints,
+        }
+        if ep_matched_tokens is not None:
+            response_data[_KEY_MATCHED_TOKENS] = int(ep_matched_tokens)
+        if endpoint_matches:
+            response_data[_KEY_ENDPOINT_MATCHES] = endpoint_matches
         return SchedulerResponse(
             response_type=SchedulerResponseType.SUCCESS,
             request_id=request.request_id,
-            data={
-                _KEY_INSTANCE: instance_data,
-                _KEY_ENDPOINT: endpoint_data,
-                _KEY_SELECTED_SCORE: selected_score,
-                _KEY_FAST_PATH: fast_path,
-            },
+            data=response_data,
         )
 
     @staticmethod
@@ -415,6 +484,47 @@ class _SchedulerRequestDispatcher:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _role_endpoint_workload(
+        self,
+        role: PDRole,
+        endpoint_matches: dict[str, int] | None = None,
+    ) -> dict[str, dict[str, float | int]]:
+        """Per-endpoint workload snapshot: {\"ins:ep\": {active_requests, active_tokens, active_kv_cache[, matched_tokens]}}."""
+        stats: dict[str, dict[str, float | int]] = {}
+        for instance in self._instance_manager.get_available_instances(role).values():
+            for pod_eps in (instance.endpoints or {}).values():
+                for ep in (pod_eps or {}).values():
+                    key = f"{instance.id}:{ep.id}"
+                    entry: dict[str, float | int] = {
+                        "active_requests": int(
+                            getattr(ep.workload, "active_requests", 0) or 0
+                        ),
+                        "active_tokens": float(
+                            getattr(ep.workload, "active_tokens", 0.0) or 0.0
+                        ),
+                        "active_kv_cache": float(
+                            getattr(ep.workload, "active_kv_cache", 0.0) or 0.0
+                        ),
+                    }
+                    if endpoint_matches is not None and key in endpoint_matches:
+                        entry["matched_tokens"] = int(endpoint_matches[key])
+                    stats[key] = entry
+        return stats
+
+    @staticmethod
+    def _extract_endpoint_matches(data: dict) -> dict[str, int]:
+        """Parse worker-provided conductor match map: {\"ins:ep\": matched_tokens}."""
+        raw = data.get(_KEY_ENDPOINT_MATCHES) if isinstance(data, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        matches: dict[str, int] = {}
+        for key, value in raw.items():
+            try:
+                matches[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return matches
 
     @staticmethod
     def _extract_allocate_candidate(data: dict) -> tuple[int, int] | None:

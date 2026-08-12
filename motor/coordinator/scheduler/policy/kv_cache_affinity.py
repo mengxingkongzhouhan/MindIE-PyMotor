@@ -60,10 +60,42 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         Rank prefill (instance, endpoint) candidates by KV-cache prefix affinity, best first.
 
         Returns up to ``top_k`` ``(instance, endpoint, score)`` tuples ordered best-first (lower
-        score = better), or ``None`` to let the caller fall back. The worker proposes this ranked
-        set to the scheduler; the scheduler may re-pick among them by its authoritative (fresh)
-        workload ledger -- so spreading a burst across the top candidates is the scheduler's job,
-        not a client-local in-flight overlay.
+        score = better), or ``None`` to let the caller fall back. Prefer
+        :meth:`select_endpoint_candidates_with_matches_from_list` when the caller also needs the
+        per-endpoint conductor match lengths.
+        """
+        result = KvCacheAffinityPolicy.select_endpoint_candidates_with_matches_from_list(
+            instances,
+            req_info,
+            mode=mode,
+            overlap_credit=overlap_credit,
+            prefill_load_scale=prefill_load_scale,
+            load_weight=load_weight,
+            load_gate_topn=load_gate_topn,
+            top_k=top_k,
+        )
+        if result is None:
+            return None
+        ranked, _match_map = result
+        return ranked
+
+    @staticmethod
+    def select_endpoint_candidates_with_matches_from_list(
+        instances: list[Instance],
+        req_info: RequestInfo,
+        mode: str = KV_AFFINITY_MODE_UNIFIED,
+        overlap_credit: float = 1.0,
+        prefill_load_scale: float = 1.0,
+        load_weight: float = 1.0,
+        load_gate_topn: int = 0,
+        top_k: int = 1,
+    ) -> tuple[list[tuple[Instance, Endpoint, float]], dict[str, int]] | None:
+        """
+        Rank prefill candidates by KV-cache prefix affinity and return conductor match lengths.
+
+        Same ranking as :meth:`select_endpoint_candidates_from_list`, plus a map
+        ``{"ins:ep": matched_tokens}`` covering every endpoint that participated in scoring
+        (conductor-reported prefix hit length, capped at prompt length).
 
         Two modes, chosen explicitly by ``mode``:
 
@@ -93,7 +125,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         :param load_gate_topn: number of least-loaded endpoints kept by the ``"load_gated"`` mode
             before the affinity ranking; 0 (default) falls back to 2. Ignored by ``"unified"``.
         :param top_k: maximum number of ranked candidates to return (>=1).
-        :returns: best-first ``[(instance, endpoint, score), ...]`` or ``None`` to fall back.
+        :returns: ``(ranked_candidates, match_map)`` or ``None`` to fall back.
         """
         encoded_ids = KvCacheAffinityPolicy._ensure_token_ids(req_info)
 
@@ -208,17 +240,19 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         tenant: dict,
         isl: int,
         overlap_credit: float,
-    ) -> tuple[list[tuple[float, int, float, Instance, Endpoint]], bool]:
+    ) -> tuple[list[tuple[float, int, float, Instance, Endpoint]], bool, dict[str, int]]:
         """
         Build the per-endpoint scoring tuples shared by the load-aware selection modes.
 
         Each candidate is ``(load_cost, matched_tokens, prefill_cost, instance, endpoint)`` where
         ``load_cost`` is the SHM-reported live workload and ``matched_tokens`` is the
         conductor-reported cached prefix length capped at the prompt. Returns
-        ``(candidates, any_instance)``; ``any_instance`` distinguishes "conductor reported nothing
-        for our instances" (fall back) from "reported, but no endpoints".
+        ``(candidates, any_instance, match_map)``; ``any_instance`` distinguishes "conductor
+        reported nothing for our instances" (fall back) from "reported, but no endpoints".
+        ``match_map`` is ``{"ins:ep": matched_tokens}`` for every scored endpoint.
         """
         candidates: list[tuple[float, int, float, Instance, Endpoint]] = []
+        match_map: dict[str, int] = {}
         any_instance = False
         for instance in instances:
             instance_data = tenant.get(f"vllm-prefill-{instance.id}", None)
@@ -237,7 +271,8 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
                 prefill_cost = max(0.0, isl - overlap_credit * matched_tokens)
                 load_cost = ep.workload.calculate_workload_score(PDRole.ROLE_P)
                 candidates.append((load_cost, matched_tokens, prefill_cost, instance, ep))
-        return candidates, any_instance
+                match_map[f"{instance.id}:{ep.id}"] = int(matched_tokens)
+        return candidates, any_instance, match_map
 
     @staticmethod
     def _select_with_load(
@@ -248,7 +283,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         prefill_load_scale: float,
         load_weight: float,
         top_k: int = 1,
-    ) -> list[tuple[Instance, Endpoint, float]] | None:
+    ) -> tuple[list[tuple[Instance, Endpoint, float]], dict[str, int]] | None:
         """
         Unified cost: score every reported endpoint by affinity-discounted prefill
         work plus live workload, and return the ``top_k`` lowest-scoring (best) candidates. An
@@ -256,7 +291,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         herding onto a single hot-prefix endpoint. With ``load_weight == 0`` the score is
         affinity-only (longest prefix wins).
         """
-        raw, any_instance = KvCacheAffinityPolicy._collect_load_candidates(
+        raw, any_instance, match_map = KvCacheAffinityPolicy._collect_load_candidates(
             instances, tenant, isl, overlap_credit
         )
         if not any_instance:
@@ -278,7 +313,10 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
             "select_endpoint(load-aware): %s-%s matched:%s score:%.2f (top%d of %d)",
             top_inst.id, top_ep.id, top_matched, top_score, len(ranked), len(candidates),
         )
-        return [(inst, ep, score) for (score, inst, ep, _matched) in ranked]
+        return (
+            [(inst, ep, score) for (score, inst, ep, _matched) in ranked],
+            match_map,
+        )
 
     @staticmethod
     def _select_load_gated(
@@ -288,7 +326,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         overlap_credit: float,
         load_gate_topn: int,
         top_k: int = 1,
-    ) -> list[tuple[Instance, Endpoint, float]] | None:
+    ) -> tuple[list[tuple[Instance, Endpoint, float]], dict[str, int]] | None:
         """
         Two-stage "load first, affinity second" ranking: keep only the ``load_gate_topn``
         least-loaded endpoints, then rank them by longest cached prefix (tie -> lighter load),
@@ -297,7 +335,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         This gives a *hard* load bound (the choice can never escape the least-loaded set) while
         still exploiting KV-cache affinity as the tie-break inside that set.
         """
-        raw, any_instance = KvCacheAffinityPolicy._collect_load_candidates(
+        raw, any_instance, match_map = KvCacheAffinityPolicy._collect_load_candidates(
             instances, tenant, isl, overlap_credit
         )
         if not any_instance:
@@ -318,7 +356,10 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
             "select_endpoint(load-gated): %s-%s matched:%s load:%.2f (top%d of %d gated, %d total)",
             top_inst.id, top_ep.id, top_matched, top_load, len(ranked), topn, len(raw),
         )
-        return [(inst, ep, load_cost) for (load_cost, _m, _p, inst, ep) in ranked]
+        return (
+            [(inst, ep, load_cost) for (load_cost, _m, _p, inst, ep) in ranked],
+            match_map,
+        )
 
     def _select_instance(self, _: PDRole = None) -> Instance | None:
         """

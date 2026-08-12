@@ -407,6 +407,37 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
         # Best-first by load: ep_b (10) then ep_c (50); ep_a (100) drops off at top_k=2.
         self.assertEqual([ep.id for _inst, ep, _score in ranked], [1, 2])
 
+    @patch.object(KvCacheAffinityPolicy, '_conductor_block_size', return_value=0)
+    @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor')
+    @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager')
+    def test_select_candidates_with_matches_returns_match_map(
+        self, mock_tokenizer_manager, mock_query_conductor, _mock_block_size
+    ):
+        """with_matches API returns per-endpoint conductor match lengths."""
+        ep_a = _make_endpoint(0, active_tokens=100.0)
+        ep_b = _make_endpoint(1, active_tokens=10.0)
+        mock_instance = Mock()
+        mock_instance.id = "inst"
+        mock_instance.endpoints = {"group": {0: ep_a, 1: ep_b}}
+        mock_instance.get_all_endpoints.return_value = (ep_a, ep_b)
+        instances = [mock_instance]
+
+        mock_req_info = Mock()
+        mock_req_info.req_data = {"prompt": "hello"}
+        mock_req_info.token_ids = [1, 2, 3, 4, 5]
+        mock_query_conductor.return_value = {
+            TENANT_ID: {"vllm-prefill-inst": {"DP": {"0": 4, "1": 1}}}
+        }
+
+        result = KvCacheAffinityPolicy.select_endpoint_candidates_with_matches_from_list(
+            instances, mock_req_info, load_weight=0.0, top_k=2
+        )
+        self.assertIsNotNone(result)
+        ranked, match_map = result
+        self.assertEqual(match_map, {"inst:0": 4, "inst:1": 1})
+        # Affinity-only: longest match wins.
+        self.assertEqual(ranked[0][1].id, 0)
+
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor')
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager')
     def test_default_mode_is_unified_and_load_aware(self, mock_tokenizer_manager, mock_query_conductor):
@@ -641,7 +672,7 @@ class TestKvAffinityFallbackConsolidation(unittest.TestCase):
 
     _AFFINITY = (
         "motor.coordinator.scheduler.runtime.scheduler_client."
-        "KvCacheAffinityPolicy.select_endpoint_candidates_from_list"
+        "KvCacheAffinityPolicy.select_endpoint_candidates_with_matches_from_list"
     )
     _RR = (
         "motor.coordinator.scheduler.runtime.scheduler_client."
@@ -685,12 +716,13 @@ class TestKvAffinityFallbackConsolidation(unittest.TestCase):
         inst, ep = Mock(), Mock()
         req = Mock(); req.req_data = {"prompt": "x"}
         ranked = [(inst, ep, 0.0)]
-        with patch(self._AFFINITY, return_value=ranked):
-            cands, policy = client._select_endpoint_candidates_from_list_with_policy(
+        with patch(self._AFFINITY, return_value=(ranked, {"1:0": 8})):
+            cands, policy, matches = client._select_endpoint_candidates_from_list_with_policy(
                 [Mock()], PDRole.ROLE_P, req, top_k=1
             )
         self.assertEqual(policy, CANDIDATE_POLICY_KV_CACHE_AFFINITY)
         self.assertEqual(cands, ranked)
+        self.assertEqual(matches, {"1:0": 8})
 
     def test_prefill_affinity_miss_falls_back_to_load_balance(self):
         """ROLE_P with no conductor match falls through to the single load_balance fallback."""
@@ -703,7 +735,7 @@ class TestKvAffinityFallbackConsolidation(unittest.TestCase):
             client, "_select_endpoint_candidates_by_load_balance",
             return_value=[(inst, ep, 1.0)],
         ) as lb:
-            cands, policy = client._select_endpoint_candidates_from_list_with_policy(
+            cands, policy, _matches = client._select_endpoint_candidates_from_list_with_policy(
                 [Mock()], PDRole.ROLE_P, req, top_k=1
             )
         self.assertEqual(policy, CANDIDATE_POLICY_LOAD_BALANCE)
@@ -721,7 +753,7 @@ class TestKvAffinityFallbackConsolidation(unittest.TestCase):
             client, "_select_endpoint_candidates_by_load_balance",
             return_value=[(inst, ep, 2.0)],
         ):
-            cands, policy = client._select_endpoint_candidates_from_list_with_policy(
+            cands, policy, _matches = client._select_endpoint_candidates_from_list_with_policy(
                 [Mock()], PDRole.ROLE_D, req, top_k=1
             )
         affinity.assert_not_called()
@@ -740,7 +772,7 @@ class TestKvAffinityFallbackConsolidation(unittest.TestCase):
         ), patch(self._RR, return_value=(inst, 1)), patch.object(
             client, "_select_endpoint_for_instance", return_value=(inst, ep)
         ):
-            cands, policy = client._select_endpoint_candidates_from_list_with_policy(
+            cands, policy, _matches = client._select_endpoint_candidates_from_list_with_policy(
                 [Mock()], PDRole.ROLE_P, req, top_k=1
             )
         self.assertEqual(policy, CANDIDATE_POLICY_ROUND_ROBIN)

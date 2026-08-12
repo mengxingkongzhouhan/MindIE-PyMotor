@@ -165,4 +165,5 @@ class WorkloadSharedMemoryReader:
                 pdrole,
                 entry.active_tokens,
                 entry.active_kv_cache,
+                entry.active_requests,
             )

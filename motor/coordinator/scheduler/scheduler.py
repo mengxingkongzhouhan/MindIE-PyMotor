@@ -107,8 +107,9 @@ class Scheduler:
         if result is None:
             return None
         instance, endpoint = result
+        # RR has no load score, but still counts in-flight requests for observability.
         workload = (
-            Workload()
+            Workload(active_requests=1)
             if not hasattr(self._scheduling_policy, "update_workload")
             else calculate_demand_workload(role, req_info)
         )
@@ -129,6 +130,7 @@ class Scheduler:
         """
         Update workload information for load-aware scheduling strategies (by id only).
         Same interface as Router/AsyncSchedulerClient; role only for signature compat (in-process policy does not use).
+        Policies without update_workload (e.g. RR) still apply the change so active_requests is tracked.
         """
         if hasattr(self._scheduling_policy, 'update_workload'):
             return await self._scheduling_policy.update_workload(
@@ -138,7 +140,11 @@ class Scheduler:
                 params.workload_action,
                 params.workload_change,
             )
-        return True  # Ignore for strategies that don't support workload tracking
+        if hasattr(self._instance_provider, "update_instance_workload"):
+            await self._instance_provider.update_instance_workload(
+                params.instance_id, params.endpoint_id, params.workload_change
+            )
+        return True
 
     async def get_available_instances(
         self, role: PDRole | None = None

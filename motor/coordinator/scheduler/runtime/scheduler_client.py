@@ -138,6 +138,7 @@ class _SchedulerInstanceCache:
         role: PDRole,
         active_tokens: float,
         active_kv_cache: float,
+        active_requests: int = 0,
     ) -> None:
         """Patch single endpoint workload from shared memory. Skip if not in cache."""
         role_map = self._instance_map.get(role) or {}
@@ -151,6 +152,7 @@ class _SchedulerInstanceCache:
         cached_endpoint.workload = Workload(
             active_tokens=active_tokens,
             active_kv_cache=active_kv_cache,
+            active_requests=active_requests,
         )
         if cached_instance.gathered_workload is None:
             cached_instance.gathered_workload = Workload()
@@ -159,6 +161,9 @@ class _SchedulerInstanceCache:
         )
         cached_instance.gathered_workload.active_kv_cache += (
             active_kv_cache - old_workload.active_kv_cache
+        )
+        cached_instance.gathered_workload.active_requests += (
+            active_requests - old_workload.active_requests
         )
 
     def _apply_role_under_lock(self, role: PDRole, instances: list[Instance]) -> None:
@@ -595,7 +600,7 @@ class AsyncSchedulerClient:
         role: PDRole | None = None,
         top_k: int = 1,
     ) -> list[tuple[Instance, Endpoint, float]]:
-        candidates, _ = await self._select_endpoint_candidates_with_policy(
+        candidates, _, _ = await self._select_endpoint_candidates_with_policy(
             req_info, role, top_k
         )
         return candidates
@@ -605,14 +610,20 @@ class AsyncSchedulerClient:
         req_info: RequestInfo,
         role: PDRole | None = None,
         top_k: int = 1,
-    ) -> tuple[list[tuple[Instance, Endpoint, float]], str]:
-        """Select endpoint candidates from cache or fresh instances."""
+    ) -> tuple[list[tuple[Instance, Endpoint, float]], str, dict[str, int]]:
+        """Select endpoint candidates from cache or fresh instances.
+
+        Returns ``(candidates, candidate_policy, endpoint_matches)``. ``endpoint_matches`` is
+        ``{"ins:ep": matched_tokens}`` under kv_cache_affinity (empty otherwise).
+        """
         cache_role = role if role is not None else PDRole.ROLE_U
         cached_instances = self._cache.get_instances(cache_role)
         if cached_instances:
             # Cache stores instances sorted by id (see replace_all call sites); use as-is for RR
-            candidates, candidate_policy = self._select_endpoint_candidates_from_list_with_policy(
-                cached_instances, cache_role, req_info, top_k=top_k
+            candidates, candidate_policy, endpoint_matches = (
+                self._select_endpoint_candidates_from_list_with_policy(
+                    cached_instances, cache_role, req_info, top_k=top_k
+                )
             )
             if candidates:
                 logger.debug(
@@ -621,15 +632,17 @@ class AsyncSchedulerClient:
                     role,
                     self._scheduler_type,
                 )
-                return candidates, candidate_policy
+                return candidates, candidate_policy, endpoint_matches
         instances = await self.get_available_instances(role)
         if not instances:
-            return [], self._scheduler_type or CANDIDATE_POLICY_ROUND_ROBIN
+            return [], self._scheduler_type or CANDIDATE_POLICY_ROUND_ROBIN, {}
 
         # get_available_instances already wrote sorted list to cache; build sorted list once for this path
         instance_list = sorted(instances.values(), key=lambda i: i.id)
-        candidates, candidate_policy = self._select_endpoint_candidates_from_list_with_policy(
-            instance_list, cache_role, req_info, top_k=top_k
+        candidates, candidate_policy, endpoint_matches = (
+            self._select_endpoint_candidates_from_list_with_policy(
+                instance_list, cache_role, req_info, top_k=top_k
+            )
         )
         if candidates:
             logger.debug(
@@ -638,7 +651,7 @@ class AsyncSchedulerClient:
                 role,
                 self._scheduler_type,
             )
-        return candidates, candidate_policy
+        return candidates, candidate_policy, endpoint_matches
 
     async def select_and_allocate(
         self,
@@ -705,8 +718,10 @@ class AsyncSchedulerClient:
             if (role is PDRole.ROLE_P and (self._scheduler_type or "") == "kv_cache_affinity")
             else 1
         )
-        candidates, candidate_policy = await self._select_endpoint_candidates_with_policy(
-            req_info, role, top_k=request_top_k
+        candidates, candidate_policy, endpoint_matches = (
+            await self._select_endpoint_candidates_with_policy(
+                req_info, role, top_k=request_top_k
+            )
         )
         if not candidates:
             return None
@@ -717,9 +732,10 @@ class AsyncSchedulerClient:
             for cand_instance, cand_endpoint, _score in candidates
         ]
 
-        # Allocation workload: RR does not use load, so use zero; LB uses demand for accounting.
+        # Allocation workload: RR has no load score but still counts in-flight requests;
+        # LB/affinity use demand scores plus active_requests=1.
         workload = (
-            Workload()
+            Workload(active_requests=1)
             if (self._scheduler_type or "round_robin") == "round_robin"
             else calculate_demand_workload(role, req_info)
         )
@@ -743,6 +759,8 @@ class AsyncSchedulerClient:
                 "instance_version": self._last_instance_version,
                 "workload": workload.model_dump(mode="json"),
                 "candidate_policy": candidate_policy,
+                # Per-endpoint conductor prefix match lengths (kv_cache_affinity only).
+                "endpoint_matches": endpoint_matches or {},
             },
         )
         response = await self._transport.send_request(request)
@@ -765,8 +783,14 @@ class AsyncSchedulerClient:
             out_endpoint = _endpoint_from_dict(endpoint_data)
             if out_endpoint:
                 logger.debug(
-                    "select_and_allocate success role=%s instance_id=%s endpoint_id=%s",
-                    role_str, out_instance.id, out_endpoint.id
+                    "select_and_allocate success role=%s instance_id=%s endpoint_id=%s "
+                    "active_requests=%s active_tokens=%s "
+                    "prefill_endpoints=%s decode_endpoints=%s",
+                    role_str, out_instance.id, out_endpoint.id,
+                    data.get("active_requests"),
+                    data.get("active_tokens"),
+                    data.get("prefill_endpoints"),
+                    data.get("decode_endpoints"),
                 )
                 return (out_instance, out_endpoint, workload)
 
@@ -983,7 +1007,7 @@ class AsyncSchedulerClient:
         req_info: RequestInfo,
         top_k: int = 1,
     ) -> list[tuple[Instance, Endpoint, float]]:
-        candidates, _ = self._select_endpoint_candidates_from_list_with_policy(
+        candidates, _, _ = self._select_endpoint_candidates_from_list_with_policy(
             instances, role, req_info, top_k
         )
         return candidates
@@ -994,16 +1018,16 @@ class AsyncSchedulerClient:
         role: PDRole,
         req_info: RequestInfo,
         top_k: int = 1,
-    ) -> tuple[list[tuple[Instance, Endpoint, float]], str]:
+    ) -> tuple[list[tuple[Instance, Endpoint, float]], str, dict[str, int]]:
         if not instances:
-            return [], self._scheduler_type or CANDIDATE_POLICY_ROUND_ROBIN
+            return [], self._scheduler_type or CANDIDATE_POLICY_ROUND_ROBIN, {}
         st = self._scheduler_type or "round_robin"
         if st == "load_balance":
             candidates = self._select_endpoint_candidates_by_load_balance(
                 instances, role, top_k
             )
             if candidates:
-                return candidates, CANDIDATE_POLICY_LOAD_BALANCE
+                return candidates, CANDIDATE_POLICY_LOAD_BALANCE, {}
             logger.warning("load_balance failed, falling back to round-robin")
         elif st == "kv_cache_affinity":
             # Affinity ranking applies to KVA-eligible roles only; others fall through to
@@ -1012,7 +1036,7 @@ class AsyncSchedulerClient:
                 # Propose the top-k affinity-ranked candidates. The scheduler re-picks among them
                 # by its authoritative (fresh) workload ledger, so a burst spreads across the top
                 # candidates without a client-local in-flight overlay.
-                ranked = KvCacheAffinityPolicy.select_endpoint_candidates_from_list(
+                result = KvCacheAffinityPolicy.select_endpoint_candidates_with_matches_from_list(
                     instances,
                     req_info,
                     mode=self._kv_affinity_mode,
@@ -1022,8 +1046,9 @@ class AsyncSchedulerClient:
                     load_gate_topn=self._kv_affinity_load_gate_topn,
                     top_k=max(1, top_k),
                 )
-                if ranked:
-                    return ranked, CANDIDATE_POLICY_KV_CACHE_AFFINITY
+                if result:
+                    ranked, match_map = result
+                    return ranked, CANDIDATE_POLICY_KV_CACHE_AFFINITY, match_map
                 logger.warning(
                     "kv_cache_affinity unavailable (no conductor match), falling back to load_balance"
                 )
@@ -1031,7 +1056,7 @@ class AsyncSchedulerClient:
                 instances, role, top_k
             )
             if candidates:
-                return candidates, CANDIDATE_POLICY_LOAD_BALANCE
+                return candidates, CANDIDATE_POLICY_LOAD_BALANCE, {}
             logger.warning("load_balance unavailable, falling back to round-robin")
         # Round-robin path: default policy or load_balance fallback
         if role not in self._instance_rr_counters:
@@ -1045,12 +1070,12 @@ class AsyncSchedulerClient:
         )
         self._instance_rr_counters[role] = next_counter - start_offset
         if not selected_instance:
-            return [], CANDIDATE_POLICY_ROUND_ROBIN
+            return [], CANDIDATE_POLICY_ROUND_ROBIN, {}
         selected = self._select_endpoint_for_instance(selected_instance)
         if not selected:
-            return [], CANDIDATE_POLICY_ROUND_ROBIN
+            return [], CANDIDATE_POLICY_ROUND_ROBIN, {}
         instance, endpoint = selected
-        return [(instance, endpoint, 0.0)], CANDIDATE_POLICY_ROUND_ROBIN
+        return [(instance, endpoint, 0.0)], CANDIDATE_POLICY_ROUND_ROBIN, {}
 
     def _select_endpoint_for_instance(
         self, instance: Instance

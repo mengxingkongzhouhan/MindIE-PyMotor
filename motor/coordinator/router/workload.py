@@ -105,8 +105,17 @@ class WorkloadActionHandler:
                     req_id, role
                 )
                 return (None, None)
-            workload_change = Workload(active_kv_cache=-current_workload.active_kv_cache)
+            # Drop in-flight request count only when this role's allocation is fully released.
+            release_requests = (
+                current_workload.active_requests if current_workload.active_tokens <= 0 else 0
+            )
+            workload_change = Workload(
+                active_kv_cache=-current_workload.active_kv_cache,
+                active_requests=-release_requests,
+            )
             current_workload.active_kv_cache = 0
+            if release_requests:
+                current_workload.active_requests = 0
             await request_mgr.update_req_workload(req_id, role, current_workload)
             if current_workload.active_tokens <= 0:
                 await request_mgr.del_req_workload(req_id, role)
@@ -119,8 +128,16 @@ class WorkloadActionHandler:
                     req_id, role
                 )
                 return (None, None)
-            workload_change = Workload(active_tokens=-current_workload.active_tokens)
+            release_requests = (
+                current_workload.active_requests if current_workload.active_kv_cache <= 0 else 0
+            )
+            workload_change = Workload(
+                active_tokens=-current_workload.active_tokens,
+                active_requests=-release_requests,
+            )
             current_workload.active_tokens = 0
+            if release_requests:
+                current_workload.active_requests = 0
             await request_mgr.update_req_workload(req_id, role, current_workload)
             if current_workload.active_kv_cache <= 0:
                 await request_mgr.del_req_workload(req_id, role)
