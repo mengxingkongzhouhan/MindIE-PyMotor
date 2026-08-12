@@ -13,8 +13,9 @@ Parses lines like:
 Rows are sorted by processing order (log appearance order across input files).
 
 Usage:
-  python3 scripts/parse_allocate_only_logs.py coordinator.log
+  python3 scripts/parse_allocate_only_logs.py coordinator.log --per-endpoint
   python3 scripts/parse_allocate_only_logs.py 'log/vllm-0-coordinator-*' --per-endpoint
+  python3 scripts/parse_allocate_only_logs.py coordinator.log --per-endpoint --pool all
   python3 scripts/parse_allocate_only_logs.py coordinator.log --format csv -o out.csv
   cat coordinator.log | python3 scripts/parse_allocate_only_logs.py -
 """
@@ -158,13 +159,21 @@ def build_summary_rows(records: list[dict[str, str]]) -> list[dict[str, str]]:
     return rows
 
 
-def build_per_endpoint_rows(records: list[dict[str, str]]) -> list[dict[str, str]]:
+def build_per_endpoint_rows(
+    records: list[dict[str, str]],
+    pools: tuple[str, ...] = ("prefill", "decode"),
+) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
+    pool_blobs = {
+        "prefill": "prefill_endpoints",
+        "decode": "decode_endpoints",
+    }
     for rec in records:
-        for pool, blob in (
-            ("prefill", rec.get("prefill_endpoints", "")),
-            ("decode", rec.get("decode_endpoints", "")),
-        ):
+        for pool in pools:
+            blob_key = pool_blobs.get(pool)
+            if not blob_key:
+                continue
+            blob = rec.get(blob_key, "")
             stats = parse_endpoint_stats(blob)
             if not stats:
                 rows.append(
@@ -231,14 +240,29 @@ def _safe_int(value: str) -> tuple[int, str]:
         return (1, value or "")
 
 
-def render_markdown(columns: list[str], rows: list[dict[str, str]], out: TextIO) -> None:
+def _request_key(row: dict[str, str]) -> tuple[str, str]:
+    """Group key used to insert blank lines between different requests."""
+    return (row.get("seq", ""), row.get("req_id", ""))
+
+
+def render_markdown(
+    columns: list[str],
+    rows: list[dict[str, str]],
+    out: TextIO,
+    separate_requests: bool = False,
+) -> None:
     if not rows:
         out.write("No ALLOCATE_ONLY records found.\n")
         return
     out.write("| " + " | ".join(columns) + " |\n")
     out.write("| " + " | ".join("---" for _ in columns) + " |\n")
+    prev_key: tuple[str, str] | None = None
     for row in rows:
+        key = _request_key(row)
+        if separate_requests and prev_key is not None and key != prev_key:
+            out.write("\n")
         out.write("| " + " | ".join(str(row.get(col, "")) for col in columns) + " |\n")
+        prev_key = key
 
 
 def render_csv(columns: list[str], rows: list[dict[str, str]], out: TextIO) -> None:
@@ -247,7 +271,12 @@ def render_csv(columns: list[str], rows: list[dict[str, str]], out: TextIO) -> N
     writer.writerows(rows)
 
 
-def render_table(columns: list[str], rows: list[dict[str, str]], out: TextIO) -> None:
+def render_table(
+    columns: list[str],
+    rows: list[dict[str, str]],
+    out: TextIO,
+    separate_requests: bool = False,
+) -> None:
     if not rows:
         out.write("No ALLOCATE_ONLY records found.\n")
         return
@@ -259,11 +288,16 @@ def render_table(columns: list[str], rows: list[dict[str, str]], out: TextIO) ->
     sep = "  ".join("-" * widths[col] for col in columns)
     out.write(header + "\n")
     out.write(sep + "\n")
+    prev_key: tuple[str, str] | None = None
     for row in rows:
+        key = _request_key(row)
+        if separate_requests and prev_key is not None and key != prev_key:
+            out.write("\n")
         out.write(
             "  ".join(str(row.get(col, "")).ljust(widths[col]) for col in columns)
             + "\n"
         )
+        prev_key = key
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -282,7 +316,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--per-endpoint",
         action="store_true",
-        help="Expand prefill/decode endpoint snapshots into one row per endpoint.",
+        help="Expand endpoint snapshots into one row per endpoint.",
+    )
+    parser.add_argument(
+        "--pool",
+        choices=("prefill", "decode", "all"),
+        default="prefill",
+        help=(
+            "Which endpoint pool to expand with --per-endpoint "
+            "(default: prefill). Use 'all' to include decode."
+        ),
+    )
+    parser.add_argument(
+        "--role",
+        choices=("prefill", "decode", "all"),
+        default="prefill",
+        help="Only keep ALLOCATE_ONLY lines for this role (default: prefill).",
     )
     parser.add_argument(
         "--format",
@@ -303,17 +352,22 @@ def main(argv: list[str] | None = None) -> int:
         parsed = parse_allocate_line(line)
         if not parsed:
             continue
+        if args.role != "all" and parsed.get("role") != args.role:
+            continue
         seq += 1
         parsed["seq"] = str(seq)
         records.append(parsed)
 
     # Processing order = log appearance order (seq already assigned).
-    # Secondary sort by req_id keeps ties stable if inputs are merged oddly.
     records.sort(key=lambda r: (int(r["seq"]), r.get("req_id", ""), r.get("role", "")))
 
     if args.per_endpoint:
         columns = _PER_ENDPOINT_COLUMNS
-        rows = build_per_endpoint_rows(records)
+        if args.pool == "all":
+            pools: tuple[str, ...] = ("prefill", "decode")
+        else:
+            pools = (args.pool,)
+        rows = build_per_endpoint_rows(records, pools=pools)
     else:
         columns = _SUMMARY_COLUMNS
         rows = build_summary_rows(records)
@@ -328,11 +382,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.format == "csv":
+            # CSV keeps contiguous rows; blank separators are for human table/markdown.
             render_csv(columns, rows, out_fh)
         elif args.format == "markdown":
-            render_markdown(columns, rows, out_fh)
+            render_markdown(columns, rows, out_fh, separate_requests=True)
         else:
-            render_table(columns, rows, out_fh)
+            render_table(columns, rows, out_fh, separate_requests=True)
     finally:
         if close_out:
             out_fh.close()
